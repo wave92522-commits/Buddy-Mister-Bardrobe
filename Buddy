@@ -1,0 +1,1915 @@
+--[[
+	╔══════════════════════════════════════════════════════════════════╗
+	║               RIFT BALISONG  •  нож-бабочка (client)              ║
+	╚══════════════════════════════════════════════════════════════════╝
+
+	LocalScript: StarterPlayer > StarterPlayerScripts, или executor.
+	Только визуал на клиенте: никакого урона и ничего не уходит на сервер.
+
+	Настоящая механика бабочки: «безопасная» рукоять в руке, клинок
+	вращается на своём пине, «кусачая» рукоять — на втором пине клинка,
+	на торце защёлка. Клинок прячется между рукоятями и виден сквозь
+	прорези. Светящаяся кромка, блик по клинку, шлейф при ударах.
+
+	Управление (нож в руках):
+	  ЛКМ / тап  → комбо из 3 ударов: слэш → бэкхенд → вертушка сверху
+	               (жми во время удара — следующий начнётся без паузы)
+	  ПКМ / L2   → тяжёлые атаки: выпад с флипом / вихрь
+	  F / Y      → осмотр: трюки → клинок вверх → мини-трюк →
+	               клинок вниз → снова трюки до конца
+	  Достаёшь   → нож открывается флипом из закрытого положения
+	  Стоишь     → иногда сам покрутит рукоять
+	  K          → редактор позы (если CONFIG.PoseGUI = true)
+]]
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local ContextActionService = game:GetService("ContextActionService")
+local TweenService = game:GetService("TweenService")
+local Workspace = game:GetService("Workspace")
+
+local LocalPlayer = Players.LocalPlayer
+
+------------------------------------------------------------------------
+-- НАСТРОЙКИ
+------------------------------------------------------------------------
+local CONFIG = {
+	ToolName = "Rift Balisong",
+	-- ""                    → встроенная картинка (executor с getcustomasset)
+	-- 1234567890            → ID декали (число)
+	-- "rbxassetid://123..." → ID картинки
+	Icon = "",
+	AnimatedIcon = true, -- блик бежит по клинку на иконке
+	IconFrameTime = 0.09,
+	IconFrames = {}, -- свои кадры (ID декалей), если не executor
+
+	Scale = 0.95, -- размер ножа (под стандартную кисть R15)
+	EquipTime = 0.25,
+	UnequipTime = 0.18,
+	ShowArmInFirstPerson = true,
+	ForceArmsVisible = true,
+	Trail = true, -- шлейф за клинком при ударах и трюках
+	BladeGlow = true, -- мягкий свет от клинка (красиво в тёмных комнатах)
+	Sparks = true, -- редкие искры, слетающие с разлома на клинке
+	IdleFidget = true, -- иногда сам крутит рукоять, пока стоишь
+	InspectKey = Enum.KeyCode.F,
+
+	PoseGUI = true, -- false → редактора не будет
+	PoseGUIKey = Enum.KeyCode.K,
+
+	Colors = {
+		Handle = Color3.fromRGB(36, 32, 46), -- решётка рукоятей
+		HandleAccent = Color3.fromRGB(74, 36, 130), -- рама рукоятей
+		Accent = Color3.fromRGB(190, 110, 255), -- неон: фиолетовый
+		Accent2 = Color3.fromRGB(255, 90, 170), -- неон: розовый
+		Blade = Color3.fromRGB(64, 66, 80), -- тёмная сталь клинка
+		BladeDark = Color3.fromRGB(46, 48, 56),
+		Edge = Color3.fromRGB(232, 236, 248), -- зеркальная кромка
+		Pins = Color3.fromRGB(235, 195, 110), -- золото
+		White = Color3.fromRGB(255, 255, 255),
+	},
+
+	-- ═══ ПОЗА ═══ (сюда вставляй конфиг из редактора)
+	-- Hand: где кисть относительно груди. X → вправо, Y → вверх,
+	--       Z → вперёд (минус = дальше). Углы — доворот ножа в градусах.
+	-- Knife: сдвиг/поворот ножа внутри ладони.
+	Pose = {
+		Hand = { X = 0.8, Y = 0.9, Z = -1.45, Pitch = 0, Yaw = 0, Roll = 0 },
+		Knife = { X = 0, Y = 0, Z = 0, Pitch = 0, Yaw = 0, Roll = 0 },
+		CameraFollow = 1, -- нож «приклеен» к камере (1) или к телу (0)
+		Sway = 1, -- инерция при повороте камеры
+		WalkBob = 1, -- покачивание при ходьбе
+		Breathing = 1, -- «дыхание» в покое
+	},
+
+	Sounds = {
+		Swoosh = { Id = "rbxasset://sounds/swoosh.wav", Volume = 0.6, Speed = 1.35 },
+		Heavy = { Id = "rbxasset://sounds/swoosh.wav", Volume = 0.85, Speed = 0.85 },
+		Click = { Id = "rbxasset://sounds/clickfast.wav", Volume = 0.55, Speed = 2.2 },
+		Clack = { Id = "rbxasset://sounds/button.wav", Volume = 0.45, Speed = 1.9 },
+		Ting = { Id = "rbxasset://sounds/electronicpingshort.wav", Volume = 0.3, Speed = 2.6 },
+	},
+}
+
+------------------------------------------------------------------------
+-- повторный запуск: удаляем предыдущую копию
+------------------------------------------------------------------------
+local SESSION_KEY = "__RiftBalisongSession"
+if _G[SESSION_KEY] and type(_G[SESSION_KEY].Destroy) == "function" then
+	pcall(_G[SESSION_KEY].Destroy)
+end
+local Session = { Connections = {}, Alive = true }
+_G[SESSION_KEY] = Session
+
+local function track(conn)
+	table.insert(Session.Connections, conn)
+	return conn
+end
+
+local RENDER_NAME = "RiftBalisongRender"
+local ACTION_ALT = "RiftBalisongHeavy"
+local ACTION_INSPECT = "RiftBalisongInspect"
+
+------------------------------------------------------------------------
+-- МАТЕМАТИКА
+------------------------------------------------------------------------
+local PI = math.pi
+local rad = math.rad
+local S = CONFIG.Scale
+
+local function ANG(x, y, z)
+	return CFrame.Angles(rad(x or 0), rad(y or 0), rad(z or 0))
+end
+local function V(x, y, z)
+	return Vector3.new(x, y, z)
+end
+local function perp(v, axis)
+	return v - axis * v:Dot(axis)
+end
+local function safeUnit(v, fallback)
+	local m = v.Magnitude
+	if m < 1e-5 then
+		return fallback
+	end
+	return v / m
+end
+local function damp(rate, dt)
+	return 1 - math.exp(-rate * dt)
+end
+local function deepCopy(t)
+	local out = {}
+	for k, v in pairs(t) do
+		out[k] = type(v) == "table" and deepCopy(v) or v
+	end
+	return out
+end
+
+local UP, DOWN = V(0, 1, 0), V(0, -1, 0)
+local LEFT, RIGHT = V(-1, 0, 0), V(1, 0, 0)
+local FWD = V(0, 0, -1)
+
+------------------------------------------------------------------------
+-- МОДЕЛЬ НОЖА
+-- {имя, форма, позиция, размер, цвет, поворот, материал, группа, роль}
+-- Группы: safe — рукоять в руке (корень, начало координат = её пин),
+-- blade — клинок (центр хвостовика, пины на x = ±0.055),
+-- bite — вторая рукоять (на пине клинка), latch — защёлка на её торце.
+------------------------------------------------------------------------
+local KNIFE = {
+	{ "Rail", "box", { -0.046, -0.5, -0.035 }, { 0.02, 0.98, 0.012 }, "HandleAccent", { 0, 0, 0 }, "smooth", "safe", "" },
+	{ "Rail", "box", { 0.046, -0.5, -0.035 }, { 0.02, 0.98, 0.012 }, "HandleAccent", { 0, 0, 0 }, "smooth", "safe", "" },
+	{ "Bar", "box", { 0, -0.26, -0.035 }, { 0.11, 0.022, 0.012 }, "HandleAccent", { 0, 0, 0 }, "smooth", "safe", "" },
+	{ "Bar", "box", { 0, -0.495, -0.035 }, { 0.11, 0.022, 0.012 }, "HandleAccent", { 0, 0, 0 }, "smooth", "safe", "" },
+	{ "Bar", "box", { 0, -0.73, -0.035 }, { 0.11, 0.022, 0.012 }, "HandleAccent", { 0, 0, 0 }, "smooth", "safe", "" },
+	{ "Lattice", "box", { 0, -0.145, -0.035 }, { 0.014, 0.241, 0.011 }, "Handle", { 0, 0, 17.38 }, "smooth", "safe", "" },
+	{ "Lattice", "box", { 0, -0.145, -0.035 }, { 0.014, 0.241, 0.011 }, "Handle", { 0, 0, -17.38 }, "smooth", "safe", "" },
+	{ "Lattice node", "cylZ", { 0, -0.145, -0.037 }, { 0.026, 0.026, 0.012 }, "Pins", { 0, 0, 0 }, "metal", "safe", "" },
+	{ "Lattice", "box", { 0, -0.3775, -0.035 }, { 0.014, 0.2458, 0.011 }, "Handle", { 0, 0, 17.03 }, "smooth", "safe", "" },
+	{ "Lattice", "box", { 0, -0.3775, -0.035 }, { 0.014, 0.2458, 0.011 }, "Handle", { 0, 0, -17.03 }, "smooth", "safe", "" },
+	{ "Lattice node", "cylZ", { 0, -0.3775, -0.037 }, { 0.026, 0.026, 0.012 }, "Pins", { 0, 0, 0 }, "metal", "safe", "" },
+	{ "Lattice", "box", { 0, -0.6125, -0.035 }, { 0.014, 0.2458, 0.011 }, "Handle", { 0, 0, 17.03 }, "smooth", "safe", "" },
+	{ "Lattice", "box", { 0, -0.6125, -0.035 }, { 0.014, 0.2458, 0.011 }, "Handle", { 0, 0, -17.03 }, "smooth", "safe", "" },
+	{ "Lattice node", "cylZ", { 0, -0.6125, -0.037 }, { 0.026, 0.026, 0.012 }, "Pins", { 0, 0, 0 }, "metal", "safe", "" },
+	{ "Lattice", "box", { 0, -0.845, -0.035 }, { 0.014, 0.241, 0.011 }, "Handle", { 0, 0, 17.38 }, "smooth", "safe", "" },
+	{ "Lattice", "box", { 0, -0.845, -0.035 }, { 0.014, 0.241, 0.011 }, "Handle", { 0, 0, -17.38 }, "smooth", "safe", "" },
+	{ "Lattice node", "cylZ", { 0, -0.845, -0.037 }, { 0.026, 0.026, 0.012 }, "Pins", { 0, 0, 0 }, "metal", "safe", "" },
+	{ "Cap", "cylZ", { 0, 0, -0.035 }, { 0.112, 0.112, 0.012 }, "HandleAccent", { 0, 0, 0 }, "smooth", "safe", "" },
+	{ "Butt", "cylZ", { 0, -0.99, -0.035 }, { 0.112, 0.112, 0.012 }, "HandleAccent", { 0, 0, 0 }, "smooth", "safe", "" },
+	{ "Inlay", "box", { -0.046, -0.5, -0.0425 }, { 0.006, 0.86, 0.003 }, "Accent", { 0, 0, 0 }, "neon", "safe", "" },
+	{ "Inlay", "box", { 0.046, -0.5, -0.0425 }, { 0.006, 0.86, 0.003 }, "Accent2", { 0, 0, 0 }, "neon", "safe", "" },
+	{ "Bushing", "cylZ", { 0, 0, -0.0425 }, { 0.07, 0.07, 0.004 }, "Pins", { 0, 0, 0 }, "metal", "safe", "" },
+	{ "Pin head", "cylZ", { 0, 0, -0.0455 }, { 0.04, 0.04, 0.004 }, "BladeDark", { 0, 0, 0 }, "smooth", "safe", "" },
+	{ "Butt ring", "cylZ", { 0, -0.99, -0.0425 }, { 0.06, 0.06, 0.004 }, "Pins", { 0, 0, 0 }, "metal", "safe", "" },
+	{ "Rail", "box", { -0.046, -0.5, 0.035 }, { 0.02, 0.98, 0.012 }, "HandleAccent", { 0, 0, 0 }, "smooth", "safe", "" },
+	{ "Rail", "box", { 0.046, -0.5, 0.035 }, { 0.02, 0.98, 0.012 }, "HandleAccent", { 0, 0, 0 }, "smooth", "safe", "" },
+	{ "Bar", "box", { 0, -0.26, 0.035 }, { 0.11, 0.022, 0.012 }, "HandleAccent", { 0, 0, 0 }, "smooth", "safe", "" },
+	{ "Bar", "box", { 0, -0.495, 0.035 }, { 0.11, 0.022, 0.012 }, "HandleAccent", { 0, 0, 0 }, "smooth", "safe", "" },
+	{ "Bar", "box", { 0, -0.73, 0.035 }, { 0.11, 0.022, 0.012 }, "HandleAccent", { 0, 0, 0 }, "smooth", "safe", "" },
+	{ "Lattice", "box", { 0, -0.145, 0.035 }, { 0.014, 0.241, 0.011 }, "Handle", { 0, 0, 17.38 }, "smooth", "safe", "" },
+	{ "Lattice", "box", { 0, -0.145, 0.035 }, { 0.014, 0.241, 0.011 }, "Handle", { 0, 0, -17.38 }, "smooth", "safe", "" },
+	{ "Lattice node", "cylZ", { 0, -0.145, 0.037 }, { 0.026, 0.026, 0.012 }, "Pins", { 0, 0, 0 }, "metal", "safe", "" },
+	{ "Lattice", "box", { 0, -0.3775, 0.035 }, { 0.014, 0.2458, 0.011 }, "Handle", { 0, 0, 17.03 }, "smooth", "safe", "" },
+	{ "Lattice", "box", { 0, -0.3775, 0.035 }, { 0.014, 0.2458, 0.011 }, "Handle", { 0, 0, -17.03 }, "smooth", "safe", "" },
+	{ "Lattice node", "cylZ", { 0, -0.3775, 0.037 }, { 0.026, 0.026, 0.012 }, "Pins", { 0, 0, 0 }, "metal", "safe", "" },
+	{ "Lattice", "box", { 0, -0.6125, 0.035 }, { 0.014, 0.2458, 0.011 }, "Handle", { 0, 0, 17.03 }, "smooth", "safe", "" },
+	{ "Lattice", "box", { 0, -0.6125, 0.035 }, { 0.014, 0.2458, 0.011 }, "Handle", { 0, 0, -17.03 }, "smooth", "safe", "" },
+	{ "Lattice node", "cylZ", { 0, -0.6125, 0.037 }, { 0.026, 0.026, 0.012 }, "Pins", { 0, 0, 0 }, "metal", "safe", "" },
+	{ "Lattice", "box", { 0, -0.845, 0.035 }, { 0.014, 0.241, 0.011 }, "Handle", { 0, 0, 17.38 }, "smooth", "safe", "" },
+	{ "Lattice", "box", { 0, -0.845, 0.035 }, { 0.014, 0.241, 0.011 }, "Handle", { 0, 0, -17.38 }, "smooth", "safe", "" },
+	{ "Lattice node", "cylZ", { 0, -0.845, 0.037 }, { 0.026, 0.026, 0.012 }, "Pins", { 0, 0, 0 }, "metal", "safe", "" },
+	{ "Cap", "cylZ", { 0, 0, 0.035 }, { 0.112, 0.112, 0.012 }, "HandleAccent", { 0, 0, 0 }, "smooth", "safe", "" },
+	{ "Butt", "cylZ", { 0, -0.99, 0.035 }, { 0.112, 0.112, 0.012 }, "HandleAccent", { 0, 0, 0 }, "smooth", "safe", "" },
+	{ "Inlay", "box", { -0.046, -0.5, 0.0425 }, { 0.006, 0.86, 0.003 }, "Accent", { 0, 0, 0 }, "neon", "safe", "" },
+	{ "Inlay", "box", { 0.046, -0.5, 0.0425 }, { 0.006, 0.86, 0.003 }, "Accent2", { 0, 0, 0 }, "neon", "safe", "" },
+	{ "Bushing", "cylZ", { 0, 0, 0.0425 }, { 0.07, 0.07, 0.004 }, "Pins", { 0, 0, 0 }, "metal", "safe", "" },
+	{ "Pin head", "cylZ", { 0, 0, 0.0455 }, { 0.04, 0.04, 0.004 }, "BladeDark", { 0, 0, 0 }, "smooth", "safe", "" },
+	{ "Butt ring", "cylZ", { 0, -0.99, 0.0425 }, { 0.06, 0.06, 0.004 }, "Pins", { 0, 0, 0 }, "metal", "safe", "" },
+	{ "Spacer", "box", { 0, -0.99, 0 }, { 0.07, 0.04, 0.058 }, "HandleAccent", { 0, 0, 0 }, "smooth", "safe", "" },
+	{ "Butt gem", "cylZ", { 0, -1.035, 0 }, { 0.05, 0.05, 0.07 }, "Accent", { 0, 0, 0 }, "neon", "safe", "" },
+	{ "Pivot pin", "cylZ", { 0, 0, 0 }, { 0.034, 0.034, 0.094 }, "Pins", { 0, 0, 0 }, "metal", "safe", "" },
+	{ "Rail", "box", { -0.046, -0.5, -0.035 }, { 0.02, 0.98, 0.012 }, "HandleAccent", { 0, 0, 0 }, "smooth", "bite", "" },
+	{ "Rail", "box", { 0.046, -0.5, -0.035 }, { 0.02, 0.98, 0.012 }, "HandleAccent", { 0, 0, 0 }, "smooth", "bite", "" },
+	{ "Bar", "box", { 0, -0.26, -0.035 }, { 0.11, 0.022, 0.012 }, "HandleAccent", { 0, 0, 0 }, "smooth", "bite", "" },
+	{ "Bar", "box", { 0, -0.495, -0.035 }, { 0.11, 0.022, 0.012 }, "HandleAccent", { 0, 0, 0 }, "smooth", "bite", "" },
+	{ "Bar", "box", { 0, -0.73, -0.035 }, { 0.11, 0.022, 0.012 }, "HandleAccent", { 0, 0, 0 }, "smooth", "bite", "" },
+	{ "Lattice", "box", { 0, -0.145, -0.035 }, { 0.014, 0.241, 0.011 }, "Handle", { 0, 0, 17.38 }, "smooth", "bite", "" },
+	{ "Lattice", "box", { 0, -0.145, -0.035 }, { 0.014, 0.241, 0.011 }, "Handle", { 0, 0, -17.38 }, "smooth", "bite", "" },
+	{ "Lattice node", "cylZ", { 0, -0.145, -0.037 }, { 0.026, 0.026, 0.012 }, "Pins", { 0, 0, 0 }, "metal", "bite", "" },
+	{ "Lattice", "box", { 0, -0.3775, -0.035 }, { 0.014, 0.2458, 0.011 }, "Handle", { 0, 0, 17.03 }, "smooth", "bite", "" },
+	{ "Lattice", "box", { 0, -0.3775, -0.035 }, { 0.014, 0.2458, 0.011 }, "Handle", { 0, 0, -17.03 }, "smooth", "bite", "" },
+	{ "Lattice node", "cylZ", { 0, -0.3775, -0.037 }, { 0.026, 0.026, 0.012 }, "Pins", { 0, 0, 0 }, "metal", "bite", "" },
+	{ "Lattice", "box", { 0, -0.6125, -0.035 }, { 0.014, 0.2458, 0.011 }, "Handle", { 0, 0, 17.03 }, "smooth", "bite", "" },
+	{ "Lattice", "box", { 0, -0.6125, -0.035 }, { 0.014, 0.2458, 0.011 }, "Handle", { 0, 0, -17.03 }, "smooth", "bite", "" },
+	{ "Lattice node", "cylZ", { 0, -0.6125, -0.037 }, { 0.026, 0.026, 0.012 }, "Pins", { 0, 0, 0 }, "metal", "bite", "" },
+	{ "Lattice", "box", { 0, -0.845, -0.035 }, { 0.014, 0.241, 0.011 }, "Handle", { 0, 0, 17.38 }, "smooth", "bite", "" },
+	{ "Lattice", "box", { 0, -0.845, -0.035 }, { 0.014, 0.241, 0.011 }, "Handle", { 0, 0, -17.38 }, "smooth", "bite", "" },
+	{ "Lattice node", "cylZ", { 0, -0.845, -0.037 }, { 0.026, 0.026, 0.012 }, "Pins", { 0, 0, 0 }, "metal", "bite", "" },
+	{ "Cap", "cylZ", { 0, 0, -0.035 }, { 0.112, 0.112, 0.012 }, "HandleAccent", { 0, 0, 0 }, "smooth", "bite", "" },
+	{ "Butt", "cylZ", { 0, -0.99, -0.035 }, { 0.112, 0.112, 0.012 }, "HandleAccent", { 0, 0, 0 }, "smooth", "bite", "" },
+	{ "Inlay", "box", { -0.046, -0.5, -0.0425 }, { 0.006, 0.86, 0.003 }, "Accent", { 0, 0, 0 }, "neon", "bite", "" },
+	{ "Inlay", "box", { 0.046, -0.5, -0.0425 }, { 0.006, 0.86, 0.003 }, "Accent2", { 0, 0, 0 }, "neon", "bite", "" },
+	{ "Bushing", "cylZ", { 0, 0, -0.0425 }, { 0.07, 0.07, 0.004 }, "Pins", { 0, 0, 0 }, "metal", "bite", "" },
+	{ "Pin head", "cylZ", { 0, 0, -0.0455 }, { 0.04, 0.04, 0.004 }, "BladeDark", { 0, 0, 0 }, "smooth", "bite", "" },
+	{ "Butt ring", "cylZ", { 0, -0.99, -0.0425 }, { 0.06, 0.06, 0.004 }, "Pins", { 0, 0, 0 }, "metal", "bite", "" },
+	{ "Rail", "box", { -0.046, -0.5, 0.035 }, { 0.02, 0.98, 0.012 }, "HandleAccent", { 0, 0, 0 }, "smooth", "bite", "" },
+	{ "Rail", "box", { 0.046, -0.5, 0.035 }, { 0.02, 0.98, 0.012 }, "HandleAccent", { 0, 0, 0 }, "smooth", "bite", "" },
+	{ "Bar", "box", { 0, -0.26, 0.035 }, { 0.11, 0.022, 0.012 }, "HandleAccent", { 0, 0, 0 }, "smooth", "bite", "" },
+	{ "Bar", "box", { 0, -0.495, 0.035 }, { 0.11, 0.022, 0.012 }, "HandleAccent", { 0, 0, 0 }, "smooth", "bite", "" },
+	{ "Bar", "box", { 0, -0.73, 0.035 }, { 0.11, 0.022, 0.012 }, "HandleAccent", { 0, 0, 0 }, "smooth", "bite", "" },
+	{ "Lattice", "box", { 0, -0.145, 0.035 }, { 0.014, 0.241, 0.011 }, "Handle", { 0, 0, 17.38 }, "smooth", "bite", "" },
+	{ "Lattice", "box", { 0, -0.145, 0.035 }, { 0.014, 0.241, 0.011 }, "Handle", { 0, 0, -17.38 }, "smooth", "bite", "" },
+	{ "Lattice node", "cylZ", { 0, -0.145, 0.037 }, { 0.026, 0.026, 0.012 }, "Pins", { 0, 0, 0 }, "metal", "bite", "" },
+	{ "Lattice", "box", { 0, -0.3775, 0.035 }, { 0.014, 0.2458, 0.011 }, "Handle", { 0, 0, 17.03 }, "smooth", "bite", "" },
+	{ "Lattice", "box", { 0, -0.3775, 0.035 }, { 0.014, 0.2458, 0.011 }, "Handle", { 0, 0, -17.03 }, "smooth", "bite", "" },
+	{ "Lattice node", "cylZ", { 0, -0.3775, 0.037 }, { 0.026, 0.026, 0.012 }, "Pins", { 0, 0, 0 }, "metal", "bite", "" },
+	{ "Lattice", "box", { 0, -0.6125, 0.035 }, { 0.014, 0.2458, 0.011 }, "Handle", { 0, 0, 17.03 }, "smooth", "bite", "" },
+	{ "Lattice", "box", { 0, -0.6125, 0.035 }, { 0.014, 0.2458, 0.011 }, "Handle", { 0, 0, -17.03 }, "smooth", "bite", "" },
+	{ "Lattice node", "cylZ", { 0, -0.6125, 0.037 }, { 0.026, 0.026, 0.012 }, "Pins", { 0, 0, 0 }, "metal", "bite", "" },
+	{ "Lattice", "box", { 0, -0.845, 0.035 }, { 0.014, 0.241, 0.011 }, "Handle", { 0, 0, 17.38 }, "smooth", "bite", "" },
+	{ "Lattice", "box", { 0, -0.845, 0.035 }, { 0.014, 0.241, 0.011 }, "Handle", { 0, 0, -17.38 }, "smooth", "bite", "" },
+	{ "Lattice node", "cylZ", { 0, -0.845, 0.037 }, { 0.026, 0.026, 0.012 }, "Pins", { 0, 0, 0 }, "metal", "bite", "" },
+	{ "Cap", "cylZ", { 0, 0, 0.035 }, { 0.112, 0.112, 0.012 }, "HandleAccent", { 0, 0, 0 }, "smooth", "bite", "" },
+	{ "Butt", "cylZ", { 0, -0.99, 0.035 }, { 0.112, 0.112, 0.012 }, "HandleAccent", { 0, 0, 0 }, "smooth", "bite", "" },
+	{ "Inlay", "box", { -0.046, -0.5, 0.0425 }, { 0.006, 0.86, 0.003 }, "Accent", { 0, 0, 0 }, "neon", "bite", "" },
+	{ "Inlay", "box", { 0.046, -0.5, 0.0425 }, { 0.006, 0.86, 0.003 }, "Accent2", { 0, 0, 0 }, "neon", "bite", "" },
+	{ "Bushing", "cylZ", { 0, 0, 0.0425 }, { 0.07, 0.07, 0.004 }, "Pins", { 0, 0, 0 }, "metal", "bite", "" },
+	{ "Pin head", "cylZ", { 0, 0, 0.0455 }, { 0.04, 0.04, 0.004 }, "BladeDark", { 0, 0, 0 }, "smooth", "bite", "" },
+	{ "Butt ring", "cylZ", { 0, -0.99, 0.0425 }, { 0.06, 0.06, 0.004 }, "Pins", { 0, 0, 0 }, "metal", "bite", "" },
+	{ "Spacer", "box", { 0, -0.99, 0 }, { 0.07, 0.04, 0.058 }, "HandleAccent", { 0, 0, 0 }, "smooth", "bite", "" },
+	{ "Butt gem", "cylZ", { 0, -1.035, 0 }, { 0.05, 0.05, 0.07 }, "Accent", { 0, 0, 0 }, "neon", "bite", "" },
+	{ "Pivot pin", "cylZ", { 0, 0, 0 }, { 0.034, 0.034, 0.094 }, "Pins", { 0, 0, 0 }, "metal", "bite", "" },
+	{ "Latch", "box", { -0.075, 0, 0.047 }, { 0.15, 0.026, 0.008 }, "Pins", { 0, 0, 0 }, "metal", "latch", "" },
+	{ "Latch knob", "cylZ", { -0.145, 0, 0.047 }, { 0.04, 0.04, 0.012 }, "Accent2", { 0, 0, 0 }, "neon", "latch", "" },
+	{ "Latch pin", "cylZ", { 0, 0, 0.047 }, { 0.032, 0.032, 0.012 }, "Pins", { 0, 0, 0 }, "metal", "latch", "" },
+	{ "Tang", "box", { 0, 0.01, 0 }, { 0.11, 0.12, 0.02 }, "BladeDark", { 0, 0, 0 }, "blade", "blade", "" },
+	{ "Tang end", "cylZ", { -0.055, 0, 0 }, { 0.115, 0.115, 0.02 }, "BladeDark", { 0, 0, 0 }, "blade", "blade", "" },
+	{ "Tang end", "cylZ", { 0.055, 0, 0 }, { 0.115, 0.115, 0.02 }, "BladeDark", { 0, 0, 0 }, "blade", "blade", "" },
+	{ "Kicker", "box", { 0.082, -0.05, 0 }, { 0.04, 0.05, 0.02 }, "BladeDark", { 0, 0, 0 }, "smooth", "blade", "" },
+	{ "Blade", "box", { 0, 0.39, 0 }, { 0.16, 0.66, 0.02 }, "Blade", { 0, 0, 0 }, "blade", "blade", "" },
+	{ "Mirror edge", "box", { 0.055, 0.39, 0 }, { 0.05, 0.66, 0.0205 }, "Edge", { 0, 0, 0 }, "blade", "blade", "" },
+	{ "Edge glow", "box", { 0.081, 0.4, 0 }, { 0.006, 0.64, 0.021 }, "Accent", { 0, 0, 0 }, "neon", "blade", "" },
+	{ "Grind line", "box", { 0.029, 0.39, 0 }, { 0.004, 0.64, 0.0208 }, "BladeDark", { 0, 0, 0 }, "smooth", "blade", "" },
+	{ "Jimping", "box", { -0.08, 0.085, 0 }, { 0.016, 0.009, 0.0205 }, "BladeDark", { 0, 0, 0 }, "smooth", "blade", "" },
+	{ "Jimping", "box", { -0.08, 0.107, 0 }, { 0.016, 0.009, 0.0205 }, "BladeDark", { 0, 0, 0 }, "smooth", "blade", "" },
+	{ "Jimping", "box", { -0.08, 0.129, 0 }, { 0.016, 0.009, 0.0205 }, "BladeDark", { 0, 0, 0 }, "smooth", "blade", "" },
+	{ "Jimping", "box", { -0.08, 0.151, 0 }, { 0.016, 0.009, 0.0205 }, "BladeDark", { 0, 0, 0 }, "smooth", "blade", "" },
+	{ "Jimping", "box", { -0.08, 0.173, 0 }, { 0.016, 0.009, 0.0205 }, "BladeDark", { 0, 0, 0 }, "smooth", "blade", "" },
+	{ "Jimping", "box", { -0.08, 0.195, 0 }, { 0.016, 0.009, 0.0205 }, "BladeDark", { 0, 0, 0 }, "smooth", "blade", "" },
+	{ "Rift", "box", { -0.008, 0.16, 0 }, { 0.01, 0.0915, 0.0216 }, "Accent", { 0, 0, -16.7 }, "neon", "blade", "" },
+	{ "Rift halo", "box", { -0.008, 0.16, 0 }, { 0.026, 0.0955, 0.0212 }, "Blade", { 0, 0, -16.7 }, "blade", "blade", "" },
+	{ "Rift", "box", { -0.011, 0.24, 0 }, { 0.01, 0.0934, 0.0216 }, "Accent2", { 0, 0, 20.56 }, "neon", "blade", "" },
+	{ "Rift halo", "box", { -0.011, 0.24, 0 }, { 0.026, 0.0974, 0.0212 }, "Blade", { 0, 0, 20.56 }, "blade", "blade", "" },
+	{ "Rift", "box", { -0.013, 0.32, 0 }, { 0.01, 0.0921, 0.0216 }, "Accent", { 0, 0, -18 }, "neon", "blade", "" },
+	{ "Rift halo", "box", { -0.013, 0.32, 0 }, { 0.026, 0.0961, 0.0212 }, "Blade", { 0, 0, -18 }, "blade", "blade", "" },
+	{ "Rift", "box", { -0.015, 0.4, 0 }, { 0.01, 0.0934, 0.0216 }, "Accent2", { 0, 0, 20.56 }, "neon", "blade", "" },
+	{ "Rift halo", "box", { -0.015, 0.4, 0 }, { 0.026, 0.0974, 0.0212 }, "Blade", { 0, 0, 20.56 }, "blade", "blade", "" },
+	{ "Rift", "box", { -0.017, 0.48, 0 }, { 0.01, 0.0921, 0.0216 }, "Accent", { 0, 0, -18 }, "neon", "blade", "" },
+	{ "Rift halo", "box", { -0.017, 0.48, 0 }, { 0.026, 0.0961, 0.0212 }, "Blade", { 0, 0, -18 }, "blade", "blade", "" },
+	{ "Rift", "box", { -0.016, 0.56, 0 }, { 0.01, 0.0915, 0.0216 }, "Accent2", { 0, 0, 16.7 }, "neon", "blade", "" },
+	{ "Rift halo", "box", { -0.016, 0.56, 0 }, { 0.026, 0.0955, 0.0212 }, "Blade", { 0, 0, 16.7 }, "blade", "blade", "" },
+	{ "Rift", "box", { -0.02, 0.64, 0 }, { 0.01, 0.0896, 0.0216 }, "Accent", { 0, 0, -11.31 }, "neon", "blade", "" },
+	{ "Rift halo", "box", { -0.02, 0.64, 0 }, { 0.026, 0.0936, 0.0212 }, "Blade", { 0, 0, -11.31 }, "blade", "blade", "" },
+	{ "Rift branch", "box", { 0.018, 0.25, 0 }, { 0.006, 0.06, 0.0216 }, "Accent2", { 0, 0, -50 }, "neon", "blade", "" },
+	{ "Rift branch", "box", { -0.045, 0.47, 0 }, { 0.006, 0.05, 0.0216 }, "Accent", { 0, 0, 55 }, "neon", "blade", "" },
+	{ "Rift branch", "box", { 0.012, 0.57, 0 }, { 0.006, 0.05, 0.0216 }, "Accent2", { 0, 0, -40 }, "neon", "blade", "" },
+	{ "Tip", "wedgeR", { 0.04, 0.86, 0 }, { 0.08, 0.28, 0.02 }, "Edge", { 0, 0, 0 }, "blade", "blade", "" },
+	{ "Tip", "wedgeL", { -0.04, 0.86, 0 }, { 0.08, 0.28, 0.02 }, "Blade", { 0, 0, 0 }, "blade", "blade", "" },
+	{ "Tip glow", "box", { 0.0425, 0.861, 0 }, { 0.006, 0.293, 0.0205 }, "Accent", { 0, 0, 15.95 }, "neon", "blade", "" },
+	{ "Swedge", "box", { -0.0425, 0.861, 0 }, { 0.005, 0.29, 0.0207 }, "Accent2", { 0, 0, -15.95 }, "neon", "blade", "" },
+	{ "Glint", "box", { 0, 0.2, 0 }, { 0.16, 0.022, 0.024 }, "White", { 0, 0, 25 }, "neon", "blade", "glint" },
+}
+
+local PIN_D = 0.055 -- половина расстояния между пинами
+local LATCH_Y = -0.99
+
+local function buildKnife(parent)
+	local model = Instance.new("Model")
+	model.Name = "RiftBalisong"
+	local rig = { Model = model, Parts = {}, Pivots = {}, Glints = {}, Glow = {}, Sounds = {} }
+
+	local function newPart(class, name, size, color, material)
+		local p = Instance.new(class)
+		p.Name = name
+		p.Size = size
+		p.Color = color
+		p.Material = material
+		p.Anchored = false
+		p.CanCollide = false
+		p.CanTouch = false
+		p.CanQuery = false
+		p.Massless = true
+		p.CastShadow = false
+		p.TopSurface = Enum.SurfaceType.Smooth
+		p.BottomSurface = Enum.SurfaceType.Smooth
+		p.Parent = model
+		table.insert(rig.Parts, p)
+		return p
+	end
+	local function pivot(name)
+		local p = newPart("Part", "Pivot_" .. name, V(0.05, 0.05, 0.05), Color3.new(), Enum.Material.SmoothPlastic)
+		p.Transparency = 1
+		rig.Pivots[name] = p
+		return p
+	end
+	local function motor(p0, p1)
+		local m = Instance.new("Motor6D")
+		m.Part0 = p0
+		m.Part1 = p1
+		m.Parent = p1
+		return m
+	end
+
+	local safe, blade, bite, latch = pivot("safe"), pivot("blade"), pivot("bite"), pivot("latch")
+	rig.Root = safe
+	rig.BladeMotor = motor(safe, blade)
+	rig.BiteMotor = motor(blade, bite)
+	rig.LatchMotor = motor(bite, latch)
+
+	local WEDGE_R = CFrame.fromMatrix(Vector3.zero, V(0, 0, 1), V(0, 1, 0), V(-1, 0, 0))
+	local WEDGE_L = CFrame.fromMatrix(Vector3.zero, V(0, 0, -1), V(0, 1, 0), V(1, 0, 0))
+
+	for _, spec in ipairs(KNIFE) do
+		local name, shape, pos, size = spec[1], spec[2], spec[3], spec[4]
+		local color = CONFIG.Colors[spec[5]] or Color3.new(1, 1, 1)
+		local rot, mat, group, role = spec[6], spec[7], spec[8], spec[9]
+		local material = mat == "neon" and Enum.Material.Neon or Enum.Material.SmoothPlastic
+		local cf = CFrame.new(V(pos[1], pos[2], pos[3]) * S) * ANG(rot[1], rot[2], rot[3])
+		local part
+		if shape == "cylZ" then
+			part = newPart("Part", name, V(size[3], size[1], size[2]) * S, color, material)
+			part.Shape = Enum.PartType.Cylinder
+			part.Size = V(size[3], size[1], size[2]) * S
+			cf = cf * CFrame.Angles(0, PI / 2, 0)
+		elseif shape == "wedgeR" or shape == "wedgeL" then
+			part = newPart("WedgePart", name, V(size[3], size[2], size[1]) * S, color, material)
+			cf = CFrame.new(cf.Position) * (shape == "wedgeR" and WEDGE_R or WEDGE_L)
+		else
+			part = newPart("Part", name, V(size[1], size[2], size[3]) * S, color, material)
+		end
+		if mat == "blade" then
+			part.Reflectance = 0.35
+		elseif mat == "metal" then
+			part.Reflectance = 0.2
+		end
+		local w = Instance.new("Weld")
+		w.Part0 = rig.Pivots[group]
+		w.Part1 = part
+		w.C0 = cf
+		w.Parent = part
+		if role == "glint" then
+			part.Transparency = 1
+			table.insert(rig.Glints, { Part = part, Weld = w })
+		end
+		if name == "Rift" or name == "Rift branch" or name == "Edge glow" or name == "Tip glow" then
+			table.insert(rig.Glow, part)
+		end
+		if name == "Blade" then
+			rig.BladeBody = part
+		end
+	end
+
+	-- шлейф за клинком
+	local a0 = Instance.new("Attachment")
+	a0.Name = "TrailTip"
+	a0.Position = V(0, 0.98, 0) * S
+	a0.Parent = blade
+	local a1 = Instance.new("Attachment")
+	a1.Name = "TrailBase"
+	a1.Position = V(0, 0.3, 0) * S
+	a1.Parent = blade
+	local trail = Instance.new("Trail")
+	trail.Attachment0 = a0
+	trail.Attachment1 = a1
+	trail.Lifetime = 0.17
+	trail.MinLength = 0.01
+	trail.LightEmission = 0.75
+	trail.LightInfluence = 0
+	trail.FaceCamera = false
+	trail.Color = ColorSequence.new(CONFIG.Colors.White, CONFIG.Colors.Accent)
+	trail.Transparency = NumberSequence.new({
+		NumberSequenceKeypoint.new(0, 0.15),
+		NumberSequenceKeypoint.new(0.5, 0.55),
+		NumberSequenceKeypoint.new(1, 1),
+	})
+	trail.WidthScale = NumberSequence.new(1, 0.4)
+	trail.Enabled = false
+	trail.Parent = blade
+	rig.Trail = trail
+
+	-- искры на кончике (блик при осмотре)
+	local sparkles = Instance.new("ParticleEmitter")
+	sparkles.Texture = "rbxasset://textures/particles/sparkles_main.dds"
+	sparkles.Color = ColorSequence.new(CONFIG.Colors.Accent:Lerp(CONFIG.Colors.White, 0.5))
+	sparkles.LightEmission = 1
+	sparkles.Lifetime = NumberRange.new(0.25, 0.5)
+	sparkles.Speed = NumberRange.new(0.4, 1.2)
+	sparkles.SpreadAngle = Vector2.new(180, 180)
+	sparkles.Rate = 0
+	sparkles.Size = NumberSequence.new({ NumberSequenceKeypoint.new(0, 0.07), NumberSequenceKeypoint.new(1, 0) })
+	sparkles.Parent = a0
+	rig.Sparkles = sparkles
+
+	-- мягкий свет от клинка
+	if CONFIG.BladeGlow then
+		local light = Instance.new("PointLight")
+		light.Color = CONFIG.Colors.Accent
+		light.Range = 5
+		light.Brightness = 0.7
+		light.Shadows = false
+		light.Parent = rig.BladeBody or blade
+		rig.Light = light
+	end
+	-- искры, слетающие с разлома
+	if CONFIG.Sparks and rig.BladeBody then
+		local sparks = Instance.new("ParticleEmitter")
+		sparks.Texture = "rbxasset://textures/particles/sparkles_main.dds"
+		sparks.Color = ColorSequence.new(CONFIG.Colors.Accent, CONFIG.Colors.Accent2)
+		sparks.LightEmission = 1
+		sparks.LightInfluence = 0
+		sparks.Lifetime = NumberRange.new(0.35, 0.7)
+		sparks.Speed = NumberRange.new(0.15, 0.5)
+		sparks.SpreadAngle = Vector2.new(180, 180)
+		sparks.Acceleration = V(0, 0.6, 0)
+		sparks.Rate = 5
+		sparks.Size = NumberSequence.new({ NumberSequenceKeypoint.new(0, 0.045), NumberSequenceKeypoint.new(1, 0) })
+		sparks.Transparency = NumberSequence.new(0.1, 1)
+		sparks.Parent = rig.BladeBody
+	end
+
+	for name, cfg in pairs(CONFIG.Sounds) do
+		local s = Instance.new("Sound")
+		s.Name = name
+		s.SoundId = cfg.Id
+		s.Volume = cfg.Volume
+		s.PlaybackSpeed = cfg.Speed
+		s.RollOffMaxDistance = 40
+		s.Parent = safe
+		rig.Sounds[name] = { Sound = s, Speed = cfg.Speed }
+	end
+
+	model.Parent = parent
+	return rig
+end
+
+------------------------------------------------------------------------
+-- ХВАТ
+-- Кисть R15: пальцы -Y, большой палец -Z, ладонь -X. Рукоять проходит
+-- через кулак вдоль оси большого пальца, клинок выходит над ним, кромка
+-- смотрит в сторону костяшек.
+------------------------------------------------------------------------
+local RK = CFrame.fromMatrix(Vector3.zero, V(0, -1, 0), V(0, 0, -1)) -- оси ножа в осях кисти
+-- Кисть R15 — плита 1×1 стад, поэтому пин вынесен за её край: клинок
+-- начинается там, где кисть заканчивается, и не прячется за ней.
+local GRIP_BASE = CFrame.new(-0.04, 0, 0) * RK * CFrame.new(-PIN_D * S, 0.55, 0)
+-- трюки: нож держат кончики пальцев у левого края кисти — крутится сбоку от неё
+local GRIP_PIN = CFrame.new(0, -0.58, -0.25) * RK
+
+-- нож крутится вокруг пина на кончиках пальцев; lift — подброс вдоль большого пальца
+local function GS(deg, lift)
+	return CFrame.new(0, 0, -(lift or 0)) * GRIP_PIN * CFrame.Angles(0, 0, rad(deg))
+end
+-- нож прокручивается в кулаке вокруг своей оси
+local function GROLL(deg)
+	return GRIP_BASE * CFrame.Angles(0, rad(deg), 0)
+end
+
+-- Кисть в торсе по тому, куда смотрит клинок и кромка (оси ножа):
+-- pos — центр кисти, blade — направление клинка, edge — куда смотрит кромка
+local function KF(x, y, z, blade, edge)
+	local Y = blade.Unit
+	local X = safeUnit(perp(edge, Y), safeUnit(perp(FWD, Y), RIGHT))
+	local Z = X:Cross(Y)
+	return CFrame.new(x, y, z) * CFrame.fromMatrix(Vector3.zero, X, Y, Z) * RK:Inverse()
+end
+
+------------------------------------------------------------------------
+-- КЛЮЧЕВЫЕ КАДРЫ
+------------------------------------------------------------------------
+local SINE, QUAD, BACK, LINEAR = Enum.EasingStyle.Sine, Enum.EasingStyle.Quad, Enum.EasingStyle.Back, Enum.EasingStyle.Linear
+local QUART = Enum.EasingStyle.Quart
+local IN, OUT, INOUT = Enum.EasingDirection.In, Enum.EasingDirection.Out, Enum.EasingDirection.InOut
+
+local CF_FIELDS = { "Hand", "Grip" }
+local NUM_FIELDS = { "A", "C", "Latch", "Shine", "Trail" }
+local ANGLE_FIELDS = { A = true, C = true }
+
+-- эталонная поза, под которую написаны анимации
+local IDLE_BLADE = V(-0.55, 0.75, -0.35)
+local IDLE_EDGE = V(-0.75, -0.5, 0.2)
+local REF_HOLD = KF(0.8, 0.9, -1.45, IDLE_BLADE, IDLE_EDGE)
+local BASE_HOLD_ROT = REF_HOLD.Rotation
+
+local HOLD, LOWERED, RETARGET, GRIP_USER, DEFAULT_POSE
+local ANIMS = {}
+
+local function buildAnim(name, kind, list, events)
+	local keys = {}
+	local prev = DEFAULT_POSE
+	for i, item in ipairs(list) do
+		local data = item[2] or {}
+		local key = { T = item[1], Ease = data.Ease or SINE, Dir = data.Dir or INOUT }
+		local base = data.Reset and DEFAULT_POSE or prev
+		for field in pairs(DEFAULT_POSE) do
+			local value = data[field]
+			if value ~= nil then
+				if field == "Hand" then
+					value = RETARGET * value
+				end
+				key[field] = value
+			else
+				key[field] = base[field]
+			end
+		end
+		keys[i] = key
+		prev = key
+	end
+	table.sort(events, function(a, b)
+		return a[1] < b[1]
+	end)
+	return { Name = name, Kind = kind, Keys = keys, Length = keys[#keys].T, Events = events }
+end
+
+local function sample(anim, t)
+	local keys = anim.Keys
+	local a, b = keys[#keys], keys[#keys]
+	for i = 1, #keys - 1 do
+		if t <= keys[i + 1].T then
+			a, b = keys[i], keys[i + 1]
+			break
+		end
+	end
+	local span = b.T - a.T
+	local alpha = span > 0 and math.clamp((t - a.T) / span, 0, 1) or 1
+	alpha = TweenService:GetValue(alpha, b.Ease, b.Dir)
+	local pose = {}
+	for _, f in ipairs(CF_FIELDS) do
+		pose[f] = a[f]:Lerp(b[f], alpha)
+	end
+	for _, f in ipairs(NUM_FIELDS) do
+		pose[f] = a[f] + (b[f] - a[f]) * alpha
+	end
+	return pose
+end
+
+local function idlePose()
+	local pose = {}
+	for k, v in pairs(DEFAULT_POSE) do
+		pose[k] = v
+	end
+	return pose
+end
+
+local function lerpPose(a, b, t)
+	local out = {}
+	for _, f in ipairs(CF_FIELDS) do
+		out[f] = a[f]:Lerp(b[f], t)
+	end
+	for _, f in ipairs(NUM_FIELDS) do
+		local from = a[f]
+		if ANGLE_FIELDS[f] then
+			from = from - 360 * math.floor((from - b[f]) / 360 + 0.5) -- кратчайший путь
+		end
+		out[f] = from + (b[f] - from) * t
+	end
+	return out
+end
+
+------------------------------------------------------------------------
+-- АНИМАЦИИ
+------------------------------------------------------------------------
+local function buildAnimations()
+	-- поза для трюков: нож плашмя к камере, кромкой влево (рука справа)
+	local function TRICK(dx, dy, dz)
+		return KF(0.7 + (dx or 0), 1.05 + (dy or 0), -1.45 + (dz or 0), UP, LEFT)
+	end
+	-- поза осмотра: клинок вверх, рука чуть левее и выше
+	local function SHOW(dx, dy, tilt)
+		return KF(0.6 + (dx or 0), 1.05 + (dy or 0), -1.4, V(-0.35 + (tilt or 0), 1, -0.1), LEFT)
+	end
+
+	------------------------------------------------------------- ДОСТАТЬ
+	-- закрытый нож поднимается, «кусачая» рукоять вылетает вверх,
+	-- клинок прокручивается через костяшки — щелчок, защёлка
+	ANIMS.Draw = buildAnim("Draw", "draw", {
+		{ 0.00, { Hand = KF(1.0, 0.3, -0.9, V(0.2, 0.5, -0.8), LEFT), A = 180, C = 180, Latch = 1 } },
+		{ 0.22, { Ease = BACK, Dir = OUT, Hand = TRICK(0.05, -0.05) } },
+		{ 0.34, { Ease = QUAD, Dir = IN, C = 0, Hand = KF(0.72, 1.03, -1.45, V(-0.25, 1, 0), LEFT) } },
+		{ 0.50, { Ease = QUAD, Dir = OUT, A = 360, Hand = KF(0.7, 1.08, -1.45, V(0.15, 1, -0.1), LEFT) } },
+		{ 0.62, { Latch = 0, Hand = TRICK(0.03, 0.02) } },
+		{ 0.85, { Reset = true, A = 360 } },
+	}, { { 0.28, "Clack" }, { 0.5, "Click" }, { 0.62, "Click" } })
+
+	------------------------------------------------------------- ЛКМ 1
+	-- слэш справа налево: замах, рез с шлейфом через центр, проводка
+	ANIMS.Slash = buildAnim("Slash", "swing", {
+		{ 0.00, {} },
+		{ 0.09, { Ease = QUAD, Dir = OUT, Hand = KF(1.0, 1.25, -0.95, V(0.45, 0.7, 0.2), V(-0.6, 0.1, -0.8)) } },
+		{ 0.12, { Ease = LINEAR, Trail = 1, Hand = KF(0.8, 1.2, -1.25, V(0.1, 0.8, -0.5), V(-0.8, 0, -0.5)) } },
+		{ 0.18, { Ease = LINEAR, Hand = KF(0.3, 1.0, -1.5, V(-0.7, 0.6, -0.35), LEFT) } },
+		{ 0.26, { Ease = QUAD, Dir = OUT, Hand = KF(-0.35, 0.8, -1.15, V(-0.85, 0.1, 0.1), V(0.2, 0.2, 1)) } },
+		{ 0.34, { Trail = 0 } },
+		{ 0.55, { Reset = true } },
+	}, { { 0.12, "Swoosh" } })
+
+	------------------------------------------------------------- ЛКМ 2
+	-- бэкхенд слева направо
+	ANIMS.Backhand = buildAnim("Backhand", "swing", {
+		{ 0.00, {} },
+		{ 0.10, { Ease = QUAD, Dir = OUT, Hand = KF(-0.1, 1.1, -1.2, V(-0.75, 0.55, 0), V(0.4, 0.4, -0.8)) } },
+		{ 0.13, { Ease = LINEAR, Trail = 1, Hand = KF(0.15, 1.12, -1.4, V(-0.4, 0.7, -0.5), V(0.7, 0.3, -0.6)) } },
+		{ 0.19, { Ease = LINEAR, Hand = KF(0.65, 1.08, -1.55, V(0.3, 0.6, -0.7), RIGHT) } },
+		{ 0.28, { Ease = QUAD, Dir = OUT, Hand = KF(1.1, 0.85, -1.05, V(0.85, 0.2, -0.1), V(0.2, 0, 1)) } },
+		{ 0.36, { Trail = 0 } },
+		{ 0.57, { Reset = true } },
+	}, { { 0.13, "Swoosh" } })
+
+	------------------------------------------------------------- ЛКМ 3
+	-- вертушка: нож крутится на кончиках пальцев на замахе, потом рез сверху
+	ANIMS.Overhead = buildAnim("Overhead", "swing", {
+		{ 0.00, {} },
+		{ 0.06, { Ease = QUAD, Dir = OUT, Hand = TRICK(0.15, 0.2, 0.15), Grip = GS(0), Trail = 1 } },
+		{ 0.11, { Ease = LINEAR, Grip = GS(-90), C = 40 } },
+		{ 0.16, { Ease = LINEAR, Grip = GS(-180), C = 10 } },
+		{ 0.21, { Ease = LINEAR, Grip = GS(-270), C = 45 } },
+		{ 0.26, { Ease = LINEAR, Grip = GS(-360), C = 0, Hand = KF(0.85, 1.55, -1.0, V(0.2, 0.75, 0.6), V(0, 0.6, -0.8)) } },
+		{ 0.30, { Ease = QUAD, Dir = IN, Grip = GRIP_BASE } },
+		{ 0.38, { Ease = LINEAR, Hand = KF(0.35, 1.05, -1.5, V(-0.4, -0.2, -0.9), V(-0.3, -1, 0.2)) } },
+		{ 0.47, { Ease = QUAD, Dir = OUT, Hand = KF(-0.2, 0.5, -1.1, V(-0.5, -0.8, -0.2), V(0, -0.3, 1)) } },
+		{ 0.55, { Trail = 0 } },
+		{ 0.80, { Reset = true } },
+	}, { { 0.1, "Clack" }, { 0.2, "Clack" }, { 0.32, "Heavy" } })
+
+	------------------------------------------------------------- ПКМ 1
+	-- выпад: отвод, резкий укол на всю руку, доворот, отскок —
+	-- и сразу флип закрыть-открыть со щелчком
+	ANIMS.Stab = buildAnim("Stab", "heavy", {
+		{ 0.00, {} },
+		{ 0.18, { Ease = QUAD, Dir = OUT, Hand = KF(0.95, 0.85, -0.75, V(-0.25, 0.1, -1), DOWN) } },
+		{ 0.24, { Ease = LINEAR, Trail = 1 } },
+		{ 0.31, { Ease = QUART, Dir = IN, Hand = KF(0.35, 1.1, -1.9, V(-0.3, 0.08, -1), DOWN) } },
+		{ 0.38, { Ease = QUAD, Dir = OUT, Hand = KF(0.34, 1.11, -1.87, V(-0.3, 0.08, -1), V(0.45, -1, 0)) } },
+		{ 0.50, { Trail = 0 } },
+		{ 0.64, { Ease = BACK, Dir = OUT, Hand = TRICK(0.05, 0), Latch = 1 } },
+		{ 0.76, { Ease = QUAD, Dir = INOUT, A = 180, C = 180, Hand = TRICK(0.06, -0.02) } },
+		{ 0.88, { Ease = QUAD, Dir = IN, C = 0, Hand = KF(0.72, 1.03, -1.45, V(-0.25, 1, 0), LEFT) } },
+		{ 1.00, { Ease = QUAD, Dir = OUT, A = 360, Hand = KF(0.7, 1.08, -1.45, V(0.15, 1, -0.1), LEFT) } },
+		{ 1.08, { Latch = 0 } },
+		{ 1.32, { Reset = true, A = 360 } },
+	}, { { 0.22, "Heavy" }, { 0.76, "Clack" }, { 0.88, "Clack" }, { 1.0, "Click" }, { 1.08, "Click" } })
+
+	------------------------------------------------------------- ПКМ 2
+	-- вихрь: нож раскручивается на пальцах (рукоять болтается),
+	-- огромный диагональный рез через весь экран, в конце прокрут рукояти
+	ANIMS.Vortex = buildAnim("Vortex", "heavy", {
+		{ 0.00, {} },
+		{ 0.15, { Ease = QUAD, Dir = OUT, Hand = KF(0.25, 1.3, -1.35, UP, LEFT), Grip = GS(0), Latch = 1, Trail = 1 } },
+		{ 0.21, { Ease = LINEAR, Grip = GS(-90), C = 60 } },
+		{ 0.27, { Ease = LINEAR, Grip = GS(-180), C = 20, Hand = KF(0.2, 1.34, -1.35, UP, LEFT) } },
+		{ 0.33, { Ease = LINEAR, Grip = GS(-270), C = 80 } },
+		{ 0.39, { Ease = LINEAR, Grip = GS(-360), C = 0 } },
+		{ 0.45, { Ease = QUAD, Dir = IN, Grip = GRIP_BASE, Hand = KF(-0.1, 1.3, -1.25, V(-0.6, 0.6, 0.4), V(0.6, 0.2, -0.8)) } },
+		{ 0.55, { Ease = LINEAR, Hand = KF(0.45, 1.05, -1.6, V(0.35, -0.1, -0.9), V(0.7, -0.7, 0)) } },
+		{ 0.65, { Ease = QUAD, Dir = OUT, Hand = KF(1.1, 0.45, -1.05, V(0.7, -0.6, 0.1), V(0.1, -0.2, 1)) } },
+		{ 0.72, { Trail = 0 } },
+		{ 0.90, { Ease = BACK, Dir = OUT, Hand = TRICK(0.05, 0) } },
+		{ 1.02, { Ease = QUAD, Dir = INOUT, C = -180 } },
+		{ 1.14, { Ease = QUAD, Dir = OUT, C = -360, Latch = 0 } },
+		{ 1.40, { Reset = true, C = -360 } },
+	}, { { 0.2, "Clack" }, { 0.32, "Clack" }, { 0.47, "Heavy" }, { 1.02, "Clack" }, { 1.14, "Click" } })
+
+	------------------------------------------------------------- ФИДЖЕТ
+	ANIMS.Fidget = buildAnim("Fidget", "fidget", {
+		{ 0.00, {} },
+		{ 0.18, { Ease = QUAD, Dir = OUT, Hand = KF(0.75, 1.0, -1.45, V(-0.1, 1, -0.2), LEFT), Latch = 1 } },
+		{ 0.34, { Ease = QUAD, Dir = INOUT, C = -180 } },
+		{ 0.50, { Ease = QUAD, Dir = OUT, C = -360 } },
+		{ 0.58, { Latch = 0 } },
+		{ 0.90, { Reset = true, C = -360 } },
+	}, { { 0.34, "Clack" }, { 0.5, "Click" }, { 0.58, "Click" } })
+
+	------------------------------------------------------------- ОСМОТР (F)
+	local L = {}
+	local function K(t, data)
+		table.insert(L, { t, data })
+	end
+	local ev = {}
+	local function E(t, name)
+		table.insert(ev, { t, name })
+	end
+
+	K(0.00, {})
+	-- ── часть 1: трюки ─────────────────────────────────────────────
+	K(0.22, { Ease = QUAD, Dir = OUT, Hand = TRICK(), Grip = GS(0), Latch = 1 })
+	E(0.2, "Click")
+	-- «веер»: два оборота на кончиках пальцев, кусачая рукоять болтается
+	local flail = { 35, 10, 45, 5, 40, 15, 30, 0 }
+	for i = 1, 8 do
+		K(0.22 + i * 0.075, {
+			Ease = LINEAR, Grip = GS(-90 * i), C = flail[i], Trail = 1,
+			Hand = TRICK(math.sin(i * 1.7) * 0.03, math.cos(i * 1.3) * 0.03),
+		})
+	end
+	E(0.4, "Clack")
+	E(0.7, "Clack")
+	K(0.86, { Trail = 0, Hand = TRICK() })
+	-- закрыть-открыть (basic)
+	K(1.00, { Ease = QUAD, Dir = INOUT, A = 180, C = 180, Hand = KF(0.72, 1.03, -1.45, V(-0.25, 1, 0), LEFT) })
+	K(1.12, { Ease = QUAD, Dir = IN, C = 0, Hand = KF(0.74, 1.03, -1.45, V(0.2, 1, 0), LEFT) })
+	K(1.26, { Ease = QUAD, Dir = OUT, A = 360, Hand = TRICK(0, 0.02) })
+	E(1.0, "Clack")
+	E(1.12, "Clack")
+	E(1.26, "Click")
+	-- подброс: два оборота в воздухе, рукояти раскрываются
+	K(1.36, { Ease = QUAD, Dir = OUT, Hand = TRICK(0, -0.08) })
+	local airC = { 40, 100, 160, 180, 160, 90, 30, 0 }
+	local airA = { 370, 380, 365, 350, 345, 355, 362, 360 }
+	for i = 1, 8 do
+		local data = {
+			Ease = (i == 8) and QUAD or LINEAR, Dir = OUT,
+			Grip = GS(-720 - 90 * i, math.sin(PI * i / 8) * 0.6),
+			C = airC[i], A = airA[i], Trail = (i < 8) and 1 or 0,
+		}
+		if i == 1 then
+			data.Hand = TRICK(0, 0.1)
+		elseif i == 7 then
+			data.Hand = TRICK(0, 0.02)
+		elseif i == 8 then
+			data.Hand = TRICK(0, -0.07)
+		end
+		K(1.36 + i * 0.08, data)
+	end
+	E(1.4, "Swoosh")
+	E(2.0, "Click")
+	K(2.12, { Ease = BACK, Dir = OUT, Hand = TRICK() })
+
+	-- ── часть 2: осмотр клинком вверх ──────────────────────────────
+	K(2.40, { Ease = SINE, Dir = OUT, Grip = GROLL(0), Hand = SHOW(0, 0) })
+	K(2.95, { Grip = GROLL(-90), Shine = 1, Hand = SHOW(-0.01, 0.02, 0.03) })
+	K(3.45, { Grip = GROLL(-180), Shine = 0, Hand = SHOW(0, 0.01, -0.03) })
+	E(2.6, "Ting")
+	E(2.62, "Glint")
+	E(3.15, "Ting")
+	E(3.17, "Glint")
+	-- мини-трюк: кусачая рукоять делает оборот, нож докручивается в кулаке
+	K(3.60, { Ease = QUAD, Dir = INOUT, C = -180, Grip = GROLL(-270), Hand = SHOW(0.02, 0.05, -0.05) })
+	K(3.75, { Ease = QUAD, Dir = OUT, C = -360, Grip = GROLL(-360), Hand = SHOW(0, -0.01, 0.05) })
+	E(3.6, "Clack")
+	E(3.75, "Click")
+
+	-- ── часть 3: осмотр клинком вниз ───────────────────────────────
+	-- пальцы держат нож за пин, клинок свисает вниз-влево сбоку от кисти
+	K(3.92, { Ease = QUAD, Dir = INOUT, Grip = GS(0), Hand = TRICK() })
+	K(4.10, { Ease = QUAD, Dir = IN, Grip = GS(-90), C = -340 })
+	K(4.32, { Ease = BACK, Dir = OUT, Grip = GS(-155), C = -375, Hand = KF(0.75, 1.1, -1.5, V(0.25, 1, 0), LEFT) })
+	K(4.85, { Ease = SINE, Dir = INOUT, Grip = GS(-163), C = -368, Shine = 1, Hand = KF(0.74, 1.12, -1.5, V(0.3, 1, 0.05), LEFT) })
+	K(5.05, { Ease = QUAD, Dir = IN, Grip = GS(-90), C = -360, Shine = 0, Hand = TRICK(0.02, 0) })
+	E(4.32, "Clack")
+	E(4.5, "Ting")
+	E(4.52, "Glint")
+	K(5.25, { Ease = QUAD, Dir = OUT, Hand = TRICK(), Grip = GS(0) })
+
+	-- ── часть 4: продолжение трюков ────────────────────────────────
+	-- обратный веер, быстрее
+	local flail2 = { 50, 15, 55, 10, 45, 20, 35, 0 }
+	for i = 1, 8 do
+		K(5.25 + i * 0.065, {
+			Ease = LINEAR, Grip = GS(90 * i), C = flail2[i] - 360, Trail = 1,
+			Hand = TRICK(math.sin(i * 2.1) * 0.035, math.cos(i * 1.6) * 0.03),
+		})
+	end
+	E(5.4, "Clack")
+	E(5.65, "Clack")
+	K(5.82, { Trail = 0 })
+	-- «дзен-перекат»: клинок закрывается и открывается в обратную сторону
+	K(5.96, { Ease = QUAD, Dir = INOUT, A = 180, C = -180, Hand = KF(0.7, 1.05, -1.45, V(0.25, 1, 0), LEFT) })
+	K(6.10, { Ease = QUAD, Dir = OUT, A = 0, C = 0, Hand = KF(0.72, 1.07, -1.45, V(-0.2, 1, 0), LEFT) })
+	E(5.96, "Clack")
+	E(6.1, "Click")
+	-- большой подброс: два оборота высоко
+	K(6.20, { Ease = QUAD, Dir = OUT, Hand = TRICK(0, -0.09) })
+	local airC2 = { 60, 130, 180, 200, 170, 100, 40, 0 }
+	local airA2 = { 15, 25, 10, -10, -15, -5, 5, 0 }
+	for i = 1, 8 do
+		local data = {
+			Ease = (i == 8) and QUAD or LINEAR, Dir = OUT,
+			Grip = GS(-90 * i, math.sin(PI * i / 8) * 0.8),
+			C = airC2[i], A = airA2[i], Trail = (i < 8) and 1 or 0,
+		}
+		if i == 1 then
+			data.Hand = TRICK(0, 0.12)
+		elseif i == 7 then
+			data.Hand = TRICK(0, 0.03)
+		elseif i == 8 then
+			data.Hand = TRICK(0, -0.08)
+		end
+		K(6.20 + i * 0.085, data)
+	end
+	E(6.24, "Swoosh")
+	E(6.88, "Click")
+	-- финальный щелчок: закрыть-открыть
+	K(7.02, { Ease = QUAD, Dir = INOUT, A = 180, C = 180, Hand = TRICK(0.02, 0) })
+	K(7.14, { Ease = QUAD, Dir = IN, C = 0, Hand = KF(0.74, 1.03, -1.45, V(0.2, 1, 0), LEFT) })
+	K(7.28, { Ease = QUAD, Dir = OUT, A = 360, Hand = TRICK(0, 0.02) })
+	E(7.02, "Clack")
+	E(7.14, "Clack")
+	E(7.28, "Click")
+	-- росчерк: быстрый оборот и защёлка
+	K(7.36, { Ease = LINEAR, Grip = GS(-90), Trail = 1 })
+	K(7.42, { Ease = LINEAR, Grip = GS(-180) })
+	K(7.48, { Ease = LINEAR, Grip = GS(-270) })
+	K(7.54, { Ease = LINEAR, Grip = GS(-360) })
+	K(7.62, { Trail = 0, Latch = 0 })
+	E(7.62, "Click")
+	K(7.95, { Reset = true, A = 360 })
+
+	ANIMS.Inspect = buildAnim("Inspect", "inspect", L, ev)
+end
+
+------------------------------------------------------------------------
+-- ПРИМЕНЕНИЕ КОНФИГА ПОЗЫ
+------------------------------------------------------------------------
+local FACTORY_POSE = deepCopy(CONFIG.Pose)
+local LMB_ANIMS, RMB_ANIMS = {}, {}
+
+local function sanitizePose()
+	local pose = CONFIG.Pose
+	for key, value in pairs(FACTORY_POSE) do
+		if type(value) == "table" then
+			pose[key] = type(pose[key]) == "table" and pose[key] or {}
+			for k, v in pairs(value) do
+				if type(pose[key][k]) ~= "number" then
+					pose[key][k] = v
+				end
+			end
+		elseif type(pose[key]) ~= "number" then
+			pose[key] = value
+		end
+	end
+end
+
+local function applyPoseConfig()
+	sanitizePose()
+	local h, k = CONFIG.Pose.Hand, CONFIG.Pose.Knife
+	HOLD = CFrame.new(h.X, h.Y, h.Z) * ANG(h.Pitch, h.Yaw, h.Roll) * BASE_HOLD_ROT
+	RETARGET = HOLD * REF_HOLD:Inverse()
+	LOWERED = CFrame.new(0.3, -1.3, 0.45) * HOLD * ANG(-40, 0, 30)
+	GRIP_USER = CFrame.new(k.X, k.Y, k.Z) * ANG(k.Pitch, k.Yaw, k.Roll)
+	DEFAULT_POSE = {
+		Hand = HOLD,
+		Grip = GRIP_BASE,
+		A = 0, -- угол клинка на пине «безопасной» рукояти (0 открыт, 180 закрыт)
+		C = 0, -- угол «кусачей» рукояти на пине клинка (0 открыт, 180 закрыт)
+		Latch = 0, -- защёлка: 0 закрыта, 1 откинута
+		Shine = 0, -- положение блика по клинку 0..1
+		Trail = 0, -- шлейф
+	}
+	buildAnimations()
+	LMB_ANIMS = { ANIMS.Slash, ANIMS.Backhand, ANIMS.Overhead }
+	RMB_ANIMS = { ANIMS.Stab, ANIMS.Vortex }
+end
+applyPoseConfig()
+
+------------------------------------------------------------------------
+-- РИГ ИГРОКА + IK (плечо, локоть, кисть)
+------------------------------------------------------------------------
+local function getRig(character)
+	local hum = character:WaitForChild("Humanoid", 10)
+	local rootPart = character:WaitForChild("HumanoidRootPart", 10)
+	if not (hum and rootPart) then
+		return nil
+	end
+	local rig = { Humanoid = hum, RootPart = rootPart, Head = character:FindFirstChild("Head"), ArmParts = {} }
+	if hum.RigType == Enum.HumanoidRigType.R15 then
+		rig.Torso = character:WaitForChild("UpperTorso", 10)
+		local ua = character:WaitForChild("RightUpperArm", 10)
+		local la = character:WaitForChild("RightLowerArm", 10)
+		local hand = character:WaitForChild("RightHand", 10)
+		if not (rig.Torso and ua and la and hand) then
+			return nil
+		end
+		local sh = ua:WaitForChild("RightShoulder", 10)
+		local el = la:WaitForChild("RightElbow", 10)
+		local wr = hand:WaitForChild("RightWrist", 10)
+		if not (sh and el and wr) then
+			return nil
+		end
+		rig.Arm = { R15 = true, Shoulder = sh, Elbow = el, Wrist = wr }
+		rig.ArmParts = { ua, la, hand }
+	else
+		rig.Torso = character:WaitForChild("Torso", 10)
+		local arm = character:WaitForChild("Right Arm", 10)
+		local sh = rig.Torso and rig.Torso:WaitForChild("Right Shoulder", 10)
+		if not (arm and sh) then
+			return nil
+		end
+		rig.Arm = { R15 = false, Shoulder = sh, ArmPart = arm }
+		rig.ArmParts = { arm }
+	end
+	return rig
+end
+
+local function frameFrom(down, pole)
+	local y = -down
+	local z = perp(pole, y)
+	if z.Magnitude < 1e-4 then
+		z = perp(Vector3.zAxis, y)
+	end
+	if z.Magnitude < 1e-4 then
+		z = perp(Vector3.xAxis, y)
+	end
+	z = z.Unit
+	return CFrame.fromMatrix(Vector3.zero, y:Cross(z), y, z)
+end
+
+local function boneRotation(boneLocal, dir, pole)
+	local fl = frameFrom(safeUnit(boneLocal, V(0, -1, 0)), Vector3.zAxis)
+	local fw = frameFrom(dir, pole)
+	return fw * fl:Inverse()
+end
+
+-- рука тянется к запястью, локоть — по линии предплечья, кисть повёрнута как надо
+local function solveHand(limb, handCF)
+	local sh, el, wr = limb.Shoulder, limb.Elbow, limb.Wrist
+	local s0 = sh.C0.Position
+	local wrist = handCF * wr.C1.Position
+	local boneU = el.C0.Position - sh.C1.Position
+	local boneL = wr.C0.Position - el.C1.Position
+	local a, b = math.max(boneU.Magnitude, 0.05), math.max(boneL.Magnitude, 0.05)
+
+	local toT = wrist - s0
+	local u = safeUnit(toT, V(0, -1, 0))
+	local dist = math.clamp(toT.Magnitude, math.abs(a - b) + 1e-3, a + b - 1e-3)
+	local cosA = math.clamp((a * a + dist * dist - b * b) / (2 * a * dist), -1, 1)
+	local sinA = math.sqrt(1 - cosA * cosA)
+	-- локоть стремится продолжить линию кисти, но с естественным уклоном вниз-наружу
+	-- локоть всегда вниз-наружу (иначе предплечье поднимается и закрывает нож);
+	-- линия кисти учитывается, только если она сама идёт вниз
+	local idealElbow = wrist + handCF.UpVector * b
+	local pole = V(0.6, -1, 0.3)
+	if idealElbow.Y < wrist.Y then
+		pole = pole + safeUnit(idealElbow - s0, V(0, -1, 0)) * 0.35
+	end
+	local w = safeUnit(perp(pole, u), safeUnit(perp(V(0.5, -1, 0.3), u), Vector3.zAxis))
+
+	local elbowPos = s0 + (u * cosA + w * sinA) * a
+	local t = s0 + u * dist
+	local d1 = safeUnit(elbowPos - s0, u)
+	local zU = safeUnit(-perp(t - elbowPos, d1), w)
+
+	local upperCF = CFrame.new(s0) * boneRotation(boneU, d1, zU) * CFrame.new(-sh.C1.Position)
+	local e = upperCF * el.C0.Position
+	local d2 = safeUnit(t - e, d1)
+	local lowerCF = CFrame.new(e) * boneRotation(boneL, d2, zU) * CFrame.new(-el.C1.Position)
+
+	local trS = sh.C0:Inverse() * upperCF * sh.C1
+	local trE = el.C0:Inverse() * (upperCF:Inverse() * lowerCF) * el.C1
+	local trW = (lowerCF * wr.C0).Rotation:Inverse() * (handCF * wr.C1).Rotation
+	return trS, trE, trW
+end
+
+local function solveR6(limb, target)
+	local sh = limb.Shoulder
+	local s0 = sh.C0.Position
+	local handLocal = V(0, -(limb.ArmPart.Size.Y / 2 - 0.2), 0)
+	local bone = handLocal - sh.C1.Position
+	local dir = safeUnit(target - s0, V(0, -1, 0))
+	local armCF = CFrame.new(s0) * boneRotation(bone, dir, V(0, -1, 1)) * CFrame.new(-sh.C1.Position)
+	return sh.C0:Inverse() * armCF * sh.C1
+end
+
+local function blendTransform(m, target, w)
+	if w >= 0.999 then
+		m.Transform = target
+	else
+		m.Transform = m.Transform:Lerp(target, w)
+	end
+end
+
+local function applyArm(limb, handCF, w)
+	if not limb.Shoulder.Parent then
+		return
+	end
+	if limb.R15 then
+		if not (limb.Elbow.Parent and limb.Wrist.Parent) then
+			return
+		end
+		local trS, trE, trW = solveHand(limb, handCF)
+		blendTransform(limb.Shoulder, trS, w)
+		blendTransform(limb.Elbow, trE, w)
+		blendTransform(limb.Wrist, trW, w)
+	else
+		blendTransform(limb.Shoulder, solveR6(limb, handCF.Position), w)
+	end
+end
+
+------------------------------------------------------------------------
+-- СОСТОЯНИЕ И ДЕЙСТВИЯ
+------------------------------------------------------------------------
+local state = {
+	Rig = nil, Tool = nil, Knife = nil, Grip = nil,
+	CharConns = {},
+	Equipped = false, Weight = 0, Action = nil, Clock = 0,
+	LmbIndex = 0, RmbIndex = 0,
+	Sway = Vector2.zero, SwayVel = Vector2.zero, LastRX = nil, LastRY = nil,
+	Pitch = 0, PivotY = 1.5, BobPhase = 0, BobAmount = 0,
+	FidgetTimer = 9, Last = nil,
+}
+local BLEND_TIME = 0.12
+
+local function playEvent(name)
+	local knife = state.Knife
+	if not knife then
+		return
+	end
+	if name == "Glint" then
+		knife.Sparkles:Emit(10)
+		return
+	end
+	local entry = knife.Sounds[name]
+	if entry then
+		entry.Sound.PlaybackSpeed = entry.Speed * (0.93 + math.random() * 0.14)
+		entry.Sound.TimePosition = 0
+		entry.Sound:Play()
+	end
+end
+
+local function startAction(anim, interrupt)
+	state.Action = { Anim = anim, Time = 0, NextEvent = 1, From = (interrupt and state.Last) or nil }
+	state.FidgetTimer = 8 + math.random() * 6
+	return true
+end
+
+-- можно ли начать новую атаку прямо сейчас (комбо)
+local function canAttack()
+	if not state.Equipped or state.Weight < 0.85 then
+		return false
+	end
+	local a = state.Action
+	if not a then
+		return true, false
+	end
+	local kind = a.Anim.Kind
+	if kind == "inspect" or kind == "fidget" then
+		return true, true
+	end
+	if (kind == "swing" or kind == "heavy") and a.Time >= a.Anim.Length * 0.55 then
+		return true, true
+	end
+	return false
+end
+
+local function onPrimary()
+	local ok, interrupt = canAttack()
+	if not ok then
+		return
+	end
+	-- если прошлый удар закончился давно — комбо начинается сначала
+	if not state.Action and state.Clock - (state.LastSwingAt or -10) > 1.2 then
+		state.LmbIndex = 0
+	end
+	state.LmbIndex = state.LmbIndex % #LMB_ANIMS + 1
+	state.LastSwingAt = state.Clock
+	startAction(LMB_ANIMS[state.LmbIndex], interrupt)
+end
+
+local function onSecondary()
+	local ok, interrupt = canAttack()
+	if not ok then
+		return
+	end
+	state.RmbIndex = state.RmbIndex % #RMB_ANIMS + 1
+	startAction(RMB_ANIMS[state.RmbIndex], interrupt)
+end
+
+local function onInspect()
+	if not state.Equipped or state.Weight < 0.85 then
+		return
+	end
+	local a = state.Action
+	if a and a.Anim.Kind ~= "fidget" then
+		return
+	end
+	startAction(ANIMS.Inspect, a ~= nil)
+end
+
+------------------------------------------------------------------------
+-- ОБНОВЛЕНИЕ НОЖА
+------------------------------------------------------------------------
+local function updateKnife(knife, pose)
+	local d = PIN_D * S
+	knife.BladeMotor.C0 = CFrame.Angles(0, 0, rad(pose.A)) * CFrame.new(d, 0, 0)
+	knife.BiteMotor.C0 = CFrame.new(d, 0, 0) * CFrame.Angles(0, 0, rad(pose.C))
+	knife.LatchMotor.C0 = CFrame.new(0, LATCH_Y * S, 0) * CFrame.Angles(0, 0, -rad(90 * math.clamp(pose.Latch, 0, 1)))
+
+	local shine = pose.Shine
+	for _, g in ipairs(knife.Glints) do
+		if shine > 0.02 and shine < 0.98 then
+			g.Weld.C0 = CFrame.new(0, (0.1 + 0.6 * shine) * S, 0) * ANG(0, 0, 25)
+			g.Part.Transparency = 1 - math.sin(PI * shine) * 0.85
+		elseif g.Part.Transparency < 1 then
+			g.Part.Transparency = 1
+		end
+	end
+	knife.Trail.Enabled = CONFIG.Trail and pose.Trail > 0.5
+
+	-- разлом «дышит»: неон мерцает волной вдоль клинка
+	local t = state.Clock
+	for i, part in ipairs(knife.Glow) do
+		part.Transparency = 0.12 + 0.12 * math.sin(t * 3.2 - i * 0.7)
+	end
+	if knife.Light then
+		knife.Light.Brightness = 0.55 + 0.2 * math.sin(t * 3.2) + (pose.Trail > 0.5 and 0.5 or 0)
+	end
+end
+
+------------------------------------------------------------------------
+-- ГЛАВНЫЙ ЦИКЛ
+------------------------------------------------------------------------
+local function step(dt)
+	if dt <= 0 then
+		return
+	end
+	dt = math.min(dt, 1 / 20)
+	local rig = state.Rig
+	if not rig or not rig.Torso.Parent or rig.Humanoid.Health <= 0 then
+		return
+	end
+	local cfg = CONFIG.Pose
+	state.Clock = state.Clock + dt
+
+	if state.Equipped then
+		state.Weight = math.min(1, state.Weight + dt / CONFIG.EquipTime)
+	else
+		state.Weight = math.max(0, state.Weight - dt / CONFIG.UnequipTime)
+	end
+	if state.Weight <= 0 then
+		state.LastRX = nil
+		return
+	end
+
+	-- инерция от поворота камеры
+	local cam = Workspace.CurrentCamera
+	local camCF = cam and cam.CFrame or rig.Torso.CFrame
+	local rx, ry = camCF:ToOrientation()
+	if state.LastRX then
+		local dYaw = (ry - state.LastRY + PI) % (2 * PI) - PI
+		local dPitch = rx - state.LastRX
+		local k = 0.04 * cfg.Sway
+		local target = Vector2.new(math.clamp(dYaw / dt * k, -0.3, 0.3), math.clamp(dPitch / dt * k, -0.25, 0.25))
+		local acc = (target - state.Sway) * 160 - state.SwayVel * 18
+		state.SwayVel = state.SwayVel + acc * dt
+		state.Sway = state.Sway + state.SwayVel * dt
+	end
+	state.LastRX, state.LastRY = rx, ry
+
+	-- нож следует за наклоном камеры, вращаясь вокруг глаз
+	local torsoCF = rig.Torso.CFrame
+	local lookLocal = torsoCF:VectorToObjectSpace(camCF.LookVector)
+	local pitch = math.asin(math.clamp(lookLocal.Y, -1, 1))
+	local firstPerson = rig.Head and (camCF.Position - rig.Head.Position).Magnitude < 2.5
+	local eyeY = 1.5
+	if firstPerson then
+		eyeY = torsoCF:PointToObjectSpace(camCF.Position).Y
+	elseif rig.Head then
+		eyeY = torsoCF:PointToObjectSpace(rig.Head.Position).Y
+	end
+	state.PivotY = state.PivotY + (math.clamp(eyeY, 0.6, 2.4) - state.PivotY) * damp(10, dt)
+	local factor = cfg.CameraFollow * (firstPerson and 1 or 0.6)
+	state.Pitch = state.Pitch + (math.clamp(pitch, -1.1, 1.1) * factor - state.Pitch) * damp(14, dt)
+	local pivot = CFrame.new(0, state.PivotY, 0)
+	local pitchCF = pivot * CFrame.Angles(state.Pitch, 0, 0) * pivot:Inverse()
+
+	-- покачивание при ходьбе
+	local vel = rig.RootPart.AssemblyLinearVelocity
+	local planar = Vector3.new(vel.X, 0, vel.Z).Magnitude
+	local moving = planar > 1.5 and rig.Humanoid.FloorMaterial ~= Enum.Material.Air
+	local bobTarget = moving and math.clamp(planar / 16, 0, 1.3) * cfg.WalkBob or 0
+	state.BobAmount = state.BobAmount + (bobTarget - state.BobAmount) * damp(8, dt)
+	state.BobPhase = state.BobPhase + dt * (4 + planar * 0.55)
+	local ph = state.BobPhase
+	local bob = V(math.sin(ph) * 0.03, -math.abs(math.cos(ph)) * 0.04, 0) * state.BobAmount
+
+	-- фиджет в покое
+	if CONFIG.IdleFidget and state.Equipped and not state.Action and state.Weight >= 1 then
+		state.FidgetTimer = state.FidgetTimer - dt
+		if state.FidgetTimer <= 0 then
+			if state.BobAmount < 0.15 then
+				startAction(ANIMS.Fidget, false)
+			else
+				state.FidgetTimer = 3
+			end
+		end
+	end
+
+	-- текущая поза
+	local action = state.Action
+	if action then
+		action.Time = action.Time + dt
+		local events = action.Anim.Events
+		while events[action.NextEvent] and action.Time >= events[action.NextEvent][1] do
+			playEvent(events[action.NextEvent][2])
+			action.NextEvent = action.NextEvent + 1
+		end
+		if action.Time >= action.Anim.Length then
+			state.Action = nil
+			action = nil
+		end
+	end
+	local pose = action and sample(action.Anim, action.Time) or idlePose()
+	if action and action.From and action.Time < BLEND_TIME then
+		local a = TweenService:GetValue(action.Time / BLEND_TIME, SINE, OUT)
+		pose = lerpPose(action.From, pose, a)
+	end
+	state.Last = pose
+
+	-- итоговое положение кисти
+	local idleMul = (action and 0.3 or 1) * cfg.Breathing
+	local t = state.Clock
+	local breathe = V(0, math.sin(t * 1.6) * 0.012 * idleMul, 0)
+	local outer = pitchCF * CFrame.new(V(state.Sway.X * 0.22, -state.Sway.Y * 0.18, 0) + bob + breathe)
+	local localRot = ANG(
+		math.sin(t * 1.7) * 1.2 * idleMul + state.Sway.Y * 18,
+		state.Sway.X * 22,
+		math.sin(t * 1.1) * 1.4 * idleMul + state.Sway.X * 14 + math.sin(ph) * 2.5 * state.BobAmount
+	)
+	local hand = outer * pose.Hand
+	hand = CFrame.new(hand.Position) * localRot * hand.Rotation
+	local eq = TweenService:GetValue(state.Weight, QUART, OUT)
+	if eq < 0.999 then
+		hand = (outer * LOWERED):Lerp(hand, eq)
+	end
+
+	if state.Equipped and state.Knife and state.Grip then
+		state.Grip.C0 = hand * GRIP_USER * pose.Grip
+		updateKnife(state.Knife, pose)
+	end
+
+	local w = state.Weight * state.Weight * (3 - 2 * state.Weight)
+	applyArm(rig.Arm, hand, w)
+end
+
+------------------------------------------------------------------------
+-- РЕДАКТОР ПОЗЫ (GUI)
+------------------------------------------------------------------------
+local Gui = {}
+
+local function fmtNum(v)
+	local s = string.format("%.3f", v)
+	s = s:gsub("0+$", ""):gsub("%.$", "")
+	if s == "-0" then
+		s = "0"
+	end
+	return s
+end
+
+local function exportPose()
+	local p = CONFIG.Pose
+	local function six(t)
+		return string.format("{ X = %s, Y = %s, Z = %s, Pitch = %s, Yaw = %s, Roll = %s }",
+			fmtNum(t.X), fmtNum(t.Y), fmtNum(t.Z), fmtNum(t.Pitch), fmtNum(t.Yaw), fmtNum(t.Roll))
+	end
+	return table.concat({
+		"Pose = {",
+		"\tHand = " .. six(p.Hand) .. ",",
+		"\tKnife = " .. six(p.Knife) .. ",",
+		string.format("\tCameraFollow = %s, Sway = %s, WalkBob = %s, Breathing = %s,",
+			fmtNum(p.CameraFollow), fmtNum(p.Sway), fmtNum(p.WalkBob), fmtNum(p.Breathing)),
+		"},",
+	}, "\n")
+end
+
+local function importPose(text)
+	local newPose = deepCopy(CONFIG.Pose)
+	local found = false
+	for _, section in ipairs({ "Hand", "Knife" }) do
+		local body = string.match(text, section .. "%s*=%s*(%b{})")
+		if body then
+			for k, v in string.gmatch(body, "(%a+)%s*=%s*(%-?[%d%.]+)") do
+				if newPose[section][k] ~= nil and tonumber(v) then
+					newPose[section][k] = tonumber(v)
+					found = true
+				end
+			end
+		end
+	end
+	for _, key in ipairs({ "CameraFollow", "Sway", "WalkBob", "Breathing" }) do
+		local v = string.match(text, key .. "%s*=%s*(%-?[%d%.]+)")
+		if v and tonumber(v) then
+			newPose[key] = tonumber(v)
+			found = true
+		end
+	end
+	if found then
+		CONFIG.Pose = newPose
+		applyPoseConfig()
+	end
+	return found
+end
+
+local function buildPoseGui()
+	local playerGui = LocalPlayer:WaitForChild("PlayerGui")
+	local old = playerGui:FindFirstChild("RiftBalisongPose")
+	if old then
+		old:Destroy()
+	end
+	local T = {
+		bg = Color3.fromRGB(18, 16, 26), panel = Color3.fromRGB(32, 28, 46), line = Color3.fromRGB(70, 56, 104),
+		accent = CONFIG.Colors.Accent, text = Color3.fromRGB(232, 228, 245), dim = Color3.fromRGB(160, 150, 185),
+	}
+	local function mk(class, props, parent)
+		local inst = Instance.new(class)
+		if inst:IsA("GuiObject") then
+			inst.BorderSizePixel = 0
+		end
+		for key, value in pairs(props) do
+			inst[key] = value
+		end
+		inst.Parent = parent
+		return inst
+	end
+	local function round(obj, r)
+		mk("UICorner", { CornerRadius = UDim.new(0, r or 6) }, obj)
+	end
+
+	local screen = mk("ScreenGui", { Name = "RiftBalisongPose", ResetOnSpawn = false, ZIndexBehavior = Enum.ZIndexBehavior.Sibling, DisplayOrder = 60 }, playerGui)
+	Gui.Screen = screen
+	local toggle = mk("TextButton", {
+		Text = "НОЖ", Size = UDim2.fromOffset(78, 28), Position = UDim2.new(1, -90, 0, 78),
+		BackgroundColor3 = T.panel, TextColor3 = T.accent, Font = Enum.Font.GothamBold, TextSize = 13,
+	}, screen)
+	round(toggle)
+	mk("UIStroke", { Color = T.line, ApplyStrokeMode = Enum.ApplyStrokeMode.Border }, toggle)
+
+	local panel = mk("Frame", {
+		Size = UDim2.new(0, 312, 1, -120), Position = UDim2.new(1, -324, 0, 112),
+		BackgroundColor3 = T.bg, Visible = false, Active = true,
+	}, screen)
+	mk("UISizeConstraint", { MaxSize = Vector2.new(312, 640) }, panel)
+	round(panel, 10)
+	mk("UIStroke", { Color = T.line }, panel)
+	Gui.Panel = panel
+	mk("TextButton", { Modal = true, BackgroundTransparency = 1, Text = "", Size = UDim2.fromOffset(0, 0) }, panel)
+
+	local header = mk("Frame", { Size = UDim2.new(1, 0, 0, 40), BackgroundTransparency = 1, Active = true }, panel)
+	mk("TextLabel", {
+		Text = "RIFT BALISONG", Size = UDim2.new(1, -60, 0, 18), Position = UDim2.fromOffset(14, 6),
+		BackgroundTransparency = 1, TextColor3 = T.accent, Font = Enum.Font.GothamBold, TextSize = 14,
+		TextXAlignment = Enum.TextXAlignment.Left,
+	}, header)
+	mk("TextLabel", {
+		Text = "редактор позы · тащи за заголовок", Size = UDim2.new(1, -60, 0, 14), Position = UDim2.fromOffset(14, 23),
+		BackgroundTransparency = 1, TextColor3 = T.dim, Font = Enum.Font.Gotham, TextSize = 11,
+		TextXAlignment = Enum.TextXAlignment.Left,
+	}, header)
+	local close = mk("TextButton", {
+		Text = "✕", Size = UDim2.fromOffset(28, 28), Position = UDim2.new(1, -38, 0, 6),
+		BackgroundColor3 = T.panel, TextColor3 = T.text, Font = Enum.Font.GothamBold, TextSize = 14,
+	}, header)
+	round(close)
+
+	local dragStart, panelStart
+	track(header.InputBegan:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+			dragStart, panelStart = input.Position, panel.Position
+		end
+	end))
+
+	local scroll = mk("ScrollingFrame", {
+		Size = UDim2.new(1, -16, 1, -48), Position = UDim2.fromOffset(8, 44), BackgroundTransparency = 1,
+		ScrollBarThickness = 4, ScrollBarImageColor3 = T.accent, CanvasSize = UDim2.new(),
+		AutomaticCanvasSize = Enum.AutomaticSize.Y, ScrollingDirection = Enum.ScrollingDirection.Y,
+	}, panel)
+	mk("UIListLayout", { Padding = UDim.new(0, 6), SortOrder = Enum.SortOrder.LayoutOrder }, scroll)
+	mk("UIPadding", { PaddingRight = UDim.new(0, 8), PaddingBottom = UDim.new(0, 8) }, scroll)
+
+	local order = 0
+	local function nextOrder()
+		order = order + 1
+		return order
+	end
+	local refreshers, activeSlider = {}, nil
+
+	local function title(text)
+		mk("TextLabel", {
+			Text = text, Size = UDim2.new(1, 0, 0, 22), BackgroundTransparency = 1, TextColor3 = T.accent,
+			Font = Enum.Font.GothamBold, TextSize = 12, TextXAlignment = Enum.TextXAlignment.Left,
+			TextYAlignment = Enum.TextYAlignment.Bottom, LayoutOrder = nextOrder(),
+		}, scroll)
+	end
+	local function getPath(path)
+		local node = CONFIG.Pose
+		for _, key in ipairs(path) do
+			node = node[key]
+		end
+		return node
+	end
+	local function setPath(path, value)
+		local node = CONFIG.Pose
+		for i = 1, #path - 1 do
+			node = node[path[i]]
+		end
+		node[path[#path]] = value
+	end
+
+	local function slider(label, path, minV, maxV, stepV)
+		local row = mk("Frame", { Size = UDim2.new(1, 0, 0, 44), BackgroundColor3 = T.panel, LayoutOrder = nextOrder() }, scroll)
+		round(row)
+		mk("TextLabel", {
+			Text = label, Size = UDim2.new(1, -86, 0, 16), Position = UDim2.fromOffset(10, 5), BackgroundTransparency = 1,
+			TextColor3 = T.text, Font = Enum.Font.Gotham, TextSize = 12, TextXAlignment = Enum.TextXAlignment.Left,
+		}, row)
+		local box = mk("TextBox", {
+			Size = UDim2.fromOffset(64, 20), Position = UDim2.new(1, -72, 0, 4), BackgroundColor3 = T.bg,
+			TextColor3 = T.accent, Font = Enum.Font.Code, TextSize = 12, ClearTextOnFocus = false, Text = "",
+		}, row)
+		round(box, 4)
+		local trackFrame = mk("Frame", { Size = UDim2.new(1, -24, 0, 6), Position = UDim2.fromOffset(12, 31), BackgroundColor3 = T.line }, row)
+		round(trackFrame, 3)
+		local fill = mk("Frame", { Size = UDim2.fromScale(0, 1), BackgroundColor3 = T.accent }, trackFrame)
+		round(fill, 3)
+		local knob = mk("Frame", {
+			Size = UDim2.fromOffset(14, 14), AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0, 0.5),
+			BackgroundColor3 = T.text,
+		}, trackFrame)
+		round(knob, 7)
+		local hit = mk("TextButton", {
+			Size = UDim2.new(1, 16, 0, 24), Position = UDim2.fromOffset(-8, -9), BackgroundTransparency = 1,
+			Text = "", AutoButtonColor = false,
+		}, trackFrame)
+		local function refresh()
+			local v = getPath(path)
+			box.Text = fmtNum(v)
+			local a = math.clamp((v - minV) / (maxV - minV), 0, 1)
+			fill.Size = UDim2.fromScale(a, 1)
+			knob.Position = UDim2.fromScale(a, 0.5)
+		end
+		local function setValue(v)
+			setPath(path, math.clamp(math.floor(v / stepV + 0.5) * stepV, minV, maxV))
+			applyPoseConfig()
+			refresh()
+		end
+		local api = {
+			FromX = function(x)
+				local a = math.clamp((x - trackFrame.AbsolutePosition.X) / math.max(trackFrame.AbsoluteSize.X, 1), 0, 1)
+				setValue(minV + (maxV - minV) * a)
+			end,
+		}
+		track(hit.InputBegan:Connect(function(input)
+			if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+				activeSlider = api
+				api.FromX(input.Position.X)
+			end
+		end))
+		track(box.FocusLost:Connect(function()
+			local n = tonumber(box.Text)
+			if n then
+				setValue(n)
+			else
+				refresh()
+			end
+		end))
+		table.insert(refreshers, refresh)
+		refresh()
+	end
+	local function button(text, primary, callback, parent)
+		local b = mk("TextButton", {
+			Text = text, Size = UDim2.new(1, 0, 0, 30), BackgroundColor3 = primary and T.accent or T.panel,
+			TextColor3 = primary and T.bg or T.text, Font = Enum.Font.GothamBold, TextSize = 12,
+			LayoutOrder = nextOrder(), AutoButtonColor = true,
+		}, parent or scroll)
+		round(b)
+		track(b.Activated:Connect(callback))
+		return b
+	end
+	local function refreshAll()
+		for _, r in ipairs(refreshers) do
+			r()
+		end
+	end
+
+	mk("TextLabel", {
+		Text = "Возьми нож в руку — изменения видны сразу. «Скопировать конфиг» → вставь блок вместо CONFIG.Pose.",
+		Size = UDim2.new(1, 0, 0, 44), BackgroundTransparency = 1, TextColor3 = T.dim, Font = Enum.Font.Gotham,
+		TextSize = 11, TextWrapped = true, TextXAlignment = Enum.TextXAlignment.Left, LayoutOrder = nextOrder(),
+	}, scroll)
+
+	title("РУКА")
+	slider("Вправо / влево", { "Hand", "X" }, -1.5, 1.5, 0.01)
+	slider("Вверх / вниз", { "Hand", "Y" }, -0.5, 2, 0.01)
+	slider("Вперёд (минус = дальше)", { "Hand", "Z" }, -2.2, -0.3, 0.01)
+	slider("Наклон", { "Hand", "Pitch" }, -90, 90, 1)
+	slider("Поворот", { "Hand", "Yaw" }, -90, 90, 1)
+	slider("Крен", { "Hand", "Roll" }, -90, 90, 1)
+	title("НОЖ В ЛАДОНИ")
+	slider("Сдвиг X", { "Knife", "X" }, -0.5, 0.5, 0.01)
+	slider("Сдвиг Y", { "Knife", "Y" }, -0.5, 0.5, 0.01)
+	slider("Сдвиг Z", { "Knife", "Z" }, -0.5, 0.5, 0.01)
+	slider("Поворот X", { "Knife", "Pitch" }, -180, 180, 1)
+	slider("Поворот Y", { "Knife", "Yaw" }, -180, 180, 1)
+	slider("Поворот Z", { "Knife", "Roll" }, -180, 180, 1)
+	title("ДИНАМИКА")
+	slider("Следовать за камерой", { "CameraFollow" }, 0, 1, 0.05)
+	slider("Инерция при повороте", { "Sway" }, 0, 2, 0.05)
+	slider("Покачивание при ходьбе", { "WalkBob" }, 0, 2, 0.05)
+	slider("Дыхание", { "Breathing" }, 0, 2, 0.05)
+
+	title("КОНФИГ")
+	local output = mk("TextBox", {
+		Size = UDim2.new(1, 0, 0, 96), BackgroundColor3 = T.panel, TextColor3 = T.dim, Font = Enum.Font.Code,
+		TextSize = 10, Text = "", PlaceholderText = "сюда можно вставить свой Pose = {...}", TextWrapped = true,
+		MultiLine = true, ClearTextOnFocus = false, TextXAlignment = Enum.TextXAlignment.Left,
+		TextYAlignment = Enum.TextYAlignment.Top, LayoutOrder = nextOrder(),
+	}, scroll)
+	round(output)
+	mk("UIPadding", { PaddingLeft = UDim.new(0, 6), PaddingTop = UDim.new(0, 4), PaddingRight = UDim.new(0, 6) }, output)
+	local status = mk("TextLabel", {
+		Text = "", Size = UDim2.new(1, 0, 0, 16), BackgroundTransparency = 1, TextColor3 = T.accent,
+		Font = Enum.Font.Gotham, TextSize = 11, TextXAlignment = Enum.TextXAlignment.Left, LayoutOrder = nextOrder(),
+	}, scroll)
+	button("Скопировать конфиг", true, function()
+		local text = exportPose()
+		output.Text = text
+		local copied = false
+		pcall(function()
+			local clip = setclipboard or toclipboard
+			if clip then
+				clip(text)
+				copied = true
+			end
+		end)
+		status.Text = copied and "Скопировано в буфер обмена" or "Выдели текст в поле и скопируй (Ctrl+A, Ctrl+C)"
+	end)
+	button("Применить из поля", false, function()
+		if importPose(output.Text) then
+			refreshAll()
+			status.Text = "Поза применена"
+		else
+			status.Text = "Не нашёл значений позы в поле"
+		end
+	end)
+	button("Сбросить к позе из скрипта", false, function()
+		CONFIG.Pose = deepCopy(FACTORY_POSE)
+		applyPoseConfig()
+		refreshAll()
+		status.Text = "Сброшено"
+	end)
+
+	title("ПРОВЕРИТЬ АНИМАЦИИ")
+	local grid = mk("Frame", { Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, BackgroundTransparency = 1, LayoutOrder = nextOrder() }, scroll)
+	mk("UIGridLayout", { CellSize = UDim2.new(0.5, -3, 0, 28), CellPadding = UDim2.fromOffset(6, 6), SortOrder = Enum.SortOrder.LayoutOrder }, grid)
+	for _, test in ipairs({
+		{ "ЛКМ 1 · Слэш", "Slash" }, { "ПКМ 1 · Выпад", "Stab" },
+		{ "ЛКМ 2 · Бэкхенд", "Backhand" }, { "ПКМ 2 · Вихрь", "Vortex" },
+		{ "ЛКМ 3 · Сверху", "Overhead" }, { "Достать", "Draw" },
+		{ "Осмотр (F)", "Inspect" }, { "Фиджет", "Fidget" },
+	}) do
+		button(test[1], false, function()
+			if state.Equipped then
+				startAction(ANIMS[test[2]], state.Action ~= nil)
+			end
+		end, grid)
+	end
+
+	track(UserInputService.InputChanged:Connect(function(input)
+		if input.UserInputType ~= Enum.UserInputType.MouseMovement and input.UserInputType ~= Enum.UserInputType.Touch then
+			return
+		end
+		if activeSlider then
+			activeSlider.FromX(input.Position.X)
+		elseif dragStart then
+			local d = input.Position - dragStart
+			panel.Position = UDim2.new(panelStart.X.Scale, panelStart.X.Offset + d.X, panelStart.Y.Scale, panelStart.Y.Offset + d.Y)
+		end
+	end))
+	track(UserInputService.InputEnded:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+			activeSlider, dragStart = nil, nil
+		end
+	end))
+
+	local prevIcon = nil
+	local function setOpen(open)
+		panel.Visible = open
+		if open then
+			prevIcon = UserInputService.MouseIconEnabled
+			refreshAll()
+		elseif prevIcon ~= nil then
+			UserInputService.MouseIconEnabled = prevIcon
+		end
+	end
+	track(toggle.Activated:Connect(function()
+		setOpen(not panel.Visible)
+	end))
+	track(close.Activated:Connect(function()
+		setOpen(false)
+	end))
+	track(UserInputService.InputBegan:Connect(function(input, processed)
+		if not processed and input.KeyCode == CONFIG.PoseGUIKey then
+			setOpen(not panel.Visible)
+		end
+	end))
+end
+
+------------------------------------------------------------------------
+-- ВИДИМОСТЬ В ПЕРВОМ ЛИЦЕ + КУРСОР ДЛЯ GUI
+------------------------------------------------------------------------
+local savedArmTransparency = {}
+local function restoreArms()
+	for part, value in pairs(savedArmTransparency) do
+		if part.Parent then
+			part.Transparency = value
+		end
+	end
+	savedArmTransparency = {}
+end
+
+local function render()
+	if CONFIG.ShowArmInFirstPerson and state.Weight > 0 and state.Rig then
+		for _, p in ipairs(state.Rig.ArmParts) do
+			p.LocalTransparencyModifier = 0
+			if CONFIG.ForceArmsVisible and p.Transparency > 0 and p.Transparency < 1.01 then
+				if savedArmTransparency[p] == nil then
+					savedArmTransparency[p] = p.Transparency
+				end
+				p.Transparency = 0
+			end
+		end
+	elseif next(savedArmTransparency) then
+		restoreArms()
+	end
+	if state.Equipped and state.Knife then
+		for _, p in ipairs(state.Knife.Parts) do
+			p.LocalTransparencyModifier = 0
+		end
+	end
+	if Gui.Panel and Gui.Panel.Visible then
+		UserInputService.MouseBehavior = Enum.MouseBehavior.Default
+		UserInputService.MouseIconEnabled = true
+	end
+end
+
+------------------------------------------------------------------------
+-- ИКОНКА (анимированная: блик бежит по клинку)
+------------------------------------------------------------------------
+local ICON_FRAMES_BASE64 = {
+	"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",
+}
+
+local function base64Decode(data)
+	local alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+	local lookup = {}
+	for i = 1, 64 do
+		lookup[string.sub(alphabet, i, i)] = i - 1
+	end
+	data = string.gsub(data, "[^%w%+/=]", "")
+	local out = {}
+	for i = 1, #data, 4 do
+		local c1, c2, c3, c4 = string.sub(data, i, i), string.sub(data, i + 1, i + 1), string.sub(data, i + 2, i + 2), string.sub(data, i + 3, i + 3)
+		local n = (lookup[c1] or 0) * 262144 + (lookup[c2] or 0) * 4096 + (lookup[c3] or 0) * 64 + (lookup[c4] or 0)
+		out[#out + 1] = string.char(math.floor(n / 65536) % 256)
+		if c3 ~= "=" and c3 ~= "" then
+			out[#out + 1] = string.char(math.floor(n / 256) % 256)
+		end
+		if c4 ~= "=" and c4 ~= "" then
+			out[#out + 1] = string.char(n % 256)
+		end
+	end
+	return table.concat(out)
+end
+
+local ICON_FRAMES = {}
+local function resolveIcons()
+	local icon = CONFIG.Icon
+	if type(icon) == "number" and icon > 0 then
+		ICON_FRAMES = { string.format("rbxthumb://type=Asset&id=%d&w=150&h=150", icon) }
+	elseif type(icon) == "string" and icon ~= "" then
+		ICON_FRAMES = { icon }
+	end
+	if CONFIG.AnimatedIcon and type(CONFIG.IconFrames) == "table" and #CONFIG.IconFrames > 0 then
+		ICON_FRAMES = {}
+		for _, id in ipairs(CONFIG.IconFrames) do
+			if type(id) == "number" and id > 0 then
+				table.insert(ICON_FRAMES, string.format("rbxthumb://type=Asset&id=%d&w=150&h=150", id))
+			elseif type(id) == "string" and id ~= "" then
+				table.insert(ICON_FRAMES, id)
+			end
+		end
+	end
+	if #ICON_FRAMES > 0 then
+		return
+	end
+	-- встроенные кадры (executor с writefile + getcustomasset)
+	pcall(function()
+		local write = writefile
+		local custom = getcustomasset or getsynasset
+		if not (write and custom) then
+			return
+		end
+		local count = CONFIG.AnimatedIcon and #ICON_FRAMES_BASE64 or 1
+		for i = 1, count do
+			local file = string.format("RiftBalisong_icon_%d.png", i)
+			write(file, base64Decode(ICON_FRAMES_BASE64[i]))
+			table.insert(ICON_FRAMES, custom(file))
+		end
+	end)
+end
+resolveIcons()
+
+if #ICON_FRAMES > 1 then
+	task.spawn(function()
+		local i = 0
+		while Session.Alive do
+			i = i % #ICON_FRAMES + 1
+			local tool = state.Tool
+			if tool and tool.Parent then
+				tool.TextureId = ICON_FRAMES[i]
+			end
+			task.wait(CONFIG.IconFrameTime)
+		end
+	end)
+end
+
+------------------------------------------------------------------------
+-- ИНСТРУМЕНТ
+------------------------------------------------------------------------
+local function unbindActions()
+	pcall(function()
+		ContextActionService:UnbindAction(ACTION_ALT)
+	end)
+	pcall(function()
+		ContextActionService:UnbindAction(ACTION_INSPECT)
+	end)
+end
+
+local function bindActions()
+	ContextActionService:BindAction(ACTION_ALT, function(_, inputState)
+		if inputState == Enum.UserInputState.Begin then
+			onSecondary()
+		end
+		return Enum.ContextActionResult.Sink
+	end, true, Enum.UserInputType.MouseButton2, Enum.KeyCode.ButtonL2)
+	ContextActionService:BindAction(ACTION_INSPECT, function(_, inputState)
+		if inputState == Enum.UserInputState.Begin then
+			onInspect()
+		end
+		return Enum.ContextActionResult.Sink
+	end, true, CONFIG.InspectKey, Enum.KeyCode.ButtonY)
+	pcall(function()
+		ContextActionService:SetTitle(ACTION_ALT, "ПКМ")
+		ContextActionService:SetTitle(ACTION_INSPECT, "F")
+	end)
+end
+
+local function createTool()
+	local backpack = LocalPlayer:FindFirstChildOfClass("Backpack") or LocalPlayer:WaitForChild("Backpack", 10)
+	if not backpack or not state.Rig then
+		return
+	end
+	local tool = Instance.new("Tool")
+	tool.Name = CONFIG.ToolName
+	tool.RequiresHandle = false
+	tool.CanBeDropped = false
+	tool.ToolTip = "ЛКМ — удары · ПКМ — тяжёлая · F — осмотр"
+	tool.TextureId = ICON_FRAMES[1] or ""
+
+	local knife = buildKnife(tool)
+	local grip = Instance.new("Motor6D")
+	grip.Name = "KnifeGrip"
+	grip.Part0 = state.Rig.Torso
+	grip.Part1 = knife.Root
+	grip.C0 = LOWERED * GRIP_BASE
+	grip.Parent = knife.Root
+	updateKnife(knife, DEFAULT_POSE)
+
+	state.Tool, state.Knife, state.Grip = tool, knife, grip
+
+	table.insert(state.CharConns, tool.Equipped:Connect(function()
+		state.Equipped = true
+		state.Weight = math.min(state.Weight, 0.05)
+		state.Action = { Anim = ANIMS.Draw, Time = 0, NextEvent = 1 }
+		state.FidgetTimer = 8 + math.random() * 6
+		bindActions()
+	end))
+	table.insert(state.CharConns, tool.Unequipped:Connect(function()
+		state.Equipped = false
+		state.Action = nil
+		if state.Knife then
+			state.Knife.Trail.Enabled = false
+		end
+		unbindActions()
+	end))
+	table.insert(state.CharConns, tool.Activated:Connect(onPrimary))
+	table.insert(state.CharConns, tool.AncestryChanged:Connect(function()
+		if not tool:IsDescendantOf(game) and state.Tool == tool then
+			state.Equipped = false
+			state.Action = nil
+			state.Tool, state.Knife, state.Grip = nil, nil, nil
+			unbindActions()
+		end
+	end))
+	tool.Parent = backpack
+end
+
+local function cleanupCharacter()
+	for _, c in ipairs(state.CharConns) do
+		c:Disconnect()
+	end
+	state.CharConns = {}
+	unbindActions()
+	if state.Tool then
+		state.Tool:Destroy()
+	end
+	state.Tool, state.Knife, state.Grip, state.Rig = nil, nil, nil, nil
+	state.Equipped, state.Action, state.Weight = false, nil, 0
+end
+
+local function onCharacter(character)
+	cleanupCharacter()
+	local rig = getRig(character)
+	if not rig or not Session.Alive or LocalPlayer.Character ~= character then
+		return
+	end
+	state.Rig = rig
+	createTool()
+	table.insert(state.CharConns, rig.Humanoid.Died:Connect(function()
+		state.Equipped = false
+		state.Action = nil
+		unbindActions()
+	end))
+end
+
+------------------------------------------------------------------------
+-- ЗАПУСК / ОЧИСТКА
+------------------------------------------------------------------------
+track(RunService.Stepped:Connect(function(_, dt)
+	step(dt)
+end))
+RunService:BindToRenderStep(RENDER_NAME, Enum.RenderPriority.Camera.Value + 1, render)
+RunService:BindToRenderStep(RENDER_NAME .. "Late", Enum.RenderPriority.Last.Value + 500, render)
+
+if CONFIG.PoseGUI then
+	task.spawn(buildPoseGui)
+end
+
+track(LocalPlayer.CharacterAdded:Connect(function(character)
+	task.defer(onCharacter, character)
+end))
+if LocalPlayer.Character then
+	task.spawn(onCharacter, LocalPlayer.Character)
+end
+
+function Session.Destroy()
+	Session.Alive = false
+	for _, c in ipairs(Session.Connections) do
+		c:Disconnect()
+	end
+	pcall(function()
+		RunService:UnbindFromRenderStep(RENDER_NAME)
+	end)
+	pcall(function()
+		RunService:UnbindFromRenderStep(RENDER_NAME .. "Late")
+	end)
+	pcall(restoreArms)
+	if Gui.Screen then
+		Gui.Screen:Destroy()
+	end
+	local rig = state.Rig
+	cleanupCharacter()
+	if rig and rig.Arm then
+		pcall(function()
+			rig.Arm.Shoulder.Transform = CFrame.new()
+			if rig.Arm.R15 then
+				rig.Arm.Elbow.Transform = CFrame.new()
+				rig.Arm.Wrist.Transform = CFrame.new()
+			end
+		end)
+	end
+end
